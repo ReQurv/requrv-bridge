@@ -188,8 +188,7 @@ pub fn check_services() -> ServiceStatus {
   let codex_app = chatgpt_app_bundle().is_some();
   let codex_cli = find_service_binary("codex").is_some() || codex_app_binary().is_some();
   let codex_app_configured = home_dir().is_some_and(|home| chatgpt_app_configured_in(&home));
-  // Claude Code is terminal-only: see the Claude Desktop section for the
-  // 3p gateway integration (app-only, configured via configure_claude_desktop).
+  // Claude Code is terminal-only; Claude Desktop is app-only (3p gateway).
   let claude_code_cli = find_service_binary("claude").is_some();
   // Hermes is a desktop app without a CLI, so only the app counts.
   let hermes_app = hermes_app_path().is_some();
@@ -1380,23 +1379,16 @@ pub fn restore_chatgpt_app(app: tauri::AppHandle) -> Result<AppRestartResult, St
 // ---------------------------------------------------------------------------
 // Claude Desktop su AI Hive (PoC: gateway locale)
 // ---------------------------------------------------------------------------
-// Claude Desktop's third-party ("3p") deployment mode points the app at a
-// gateway that speaks the Anthropic Messages protocol. The managed profile
-// (configLibrary/<uuid>.json) declares the gateway URL, the credential and
-// the model rows shown in the picker: the app sends the claude-* slot name
-// to POST /v1/messages and the gateway resolves it to the real model.
-//
-// PoC: the gateway base URL points at the local requrv-proxy dev server
-// (bun dev, port 3000) which mounts the Claude gateway at /api/claude. For
-// production this becomes https://hive.requrv.ai/api/claude once the proxy
-// changes are deployed.
+// Third-party ("3p") deployment mode: the managed profile in configLibrary
+// declares the gateway URL, credential and model rows; the app sends the
+// claude-* slot to POST /v1/messages and the gateway resolves it to the real
+// model. PoC: base URL points at the local proxy; production is
+// https://hive.requrv.ai/api/claude.
 const HIVE_CLAUDE_GATEWAY_BASE_URL: &str = "http://localhost:3000/api/claude";
-// Fixed profile id used by the managed Claude profile (same convention as
-// Ollama's launcher); the app treats it as an opaque identifier.
+// Fixed profile id (same convention as Ollama's launcher); opaque to the app.
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000000114";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "ReQurv AI Hive";
-// The claude-* slot the app puts on the wire; the gateway maps it to the
-// model that owns the slot (LlmModel.claudeSlot).
+// The claude-* slot on the wire; the gateway maps it to LlmModel.claudeSlot.
 const CLAUDE_DESKTOP_SLOT: &str = "claude-sonnet-5";
 const CLAUDE_DESKTOP_BACKUP: &str = "hive.bak";
 
@@ -1409,14 +1401,13 @@ fn claude_desktop_app_path() -> Option<PathBuf> {
 }
 
 struct ClaudeDesktopPaths {
-  // The "normal" profile config: its deploymentMode selects which profile
-  // root the app boots into.
+  // deploymentMode here selects which profile root the app boots into.
   normal_config: PathBuf,
-  // The 3p profile root config (deploymentMode must be "3p" there too).
+  // 3p profile root config (deploymentMode must be "3p" there too).
   third_party_config: PathBuf,
   // configLibrary metadata: appliedId selects the active profile.
   meta: PathBuf,
-  // The managed gateway profile itself.
+  // The managed gateway profile.
   profile: PathBuf,
 }
 
@@ -1440,8 +1431,9 @@ fn backup_path_for(path: &Path) -> PathBuf {
     CLAUDE_DESKTOP_BACKUP
   ))
 }
-// Back up a file once (the first .hive.bak wins) so restore always returns
-// to the pre-Hive state, even across repeated configure/restore cycles.
+
+// Back up a file once (first .hive.bak wins) so restore always returns to
+// the pre-Hive state, even across repeated configure/restore cycles.
 fn backup_once(path: &Path) -> Result<(), String> {
   if !path.exists() {
     return Ok(());
@@ -1525,27 +1517,20 @@ fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<()
   }
   set_deployment_mode(&paths.normal_config, "3p")?;
   set_deployment_mode(&paths.third_party_config, "3p")?;
-  // Merge the managed entry into any existing meta instead of clobbering it:
-  // other 3p profiles (if present) must survive.
+  // Merge into any existing meta: other 3p profiles must survive.
   let mut meta = read_json_allow_missing(&paths.meta)?;
   if !meta.is_object() {
     meta = serde_json::json!({});
   }
-  let entries = meta
-    .get_mut("entries")
-    .and_then(|e| e.as_array_mut())
-    .map(|entries| {
-      entries.retain(|e| e.get("id") != Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)));
-      entries.push(serde_json::json!({
-        "id": CLAUDE_DESKTOP_PROFILE_ID,
-        "name": CLAUDE_DESKTOP_PROFILE_NAME
-      }));
-    });
-  if entries.is_none() {
-    meta["entries"] = serde_json::json!([
-      { "id": CLAUDE_DESKTOP_PROFILE_ID, "name": CLAUDE_DESKTOP_PROFILE_NAME }
-    ]);
+  if !meta.get("entries").and_then(|e| e.as_array()).is_some() {
+    meta["entries"] = serde_json::json!([]);
   }
+  let entries = meta["entries"].as_array_mut().unwrap();
+  entries.retain(|e| e.get("id") != Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)));
+  entries.push(serde_json::json!({
+    "id": CLAUDE_DESKTOP_PROFILE_ID,
+    "name": CLAUDE_DESKTOP_PROFILE_NAME
+  }));
   meta["appliedId"] = serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID);
   write_json(&paths.meta, &meta)?;
   write_json(&paths.profile, &claude_desktop_profile_value(model, key))?;
@@ -1700,8 +1685,6 @@ fn restart_claude_desktop_with(reapply: impl FnOnce(&Path) -> Result<(), String>
   open_claude_desktop()
 }
 
-// Point Claude Desktop at the local AI Hive gateway and report whether a
-// running instance needs a restart to load the new profile.
 #[tauri::command]
 pub async fn configure_claude_desktop(model: String, key: String) -> Result<AppRestartResult, String> {
   let model = model.trim();
