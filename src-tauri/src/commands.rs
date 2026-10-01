@@ -581,7 +581,7 @@ fn codex_app_binary() -> Option<PathBuf> {
 }
 
 #[tauri::command]
-pub async fn launch_service(app: tauri::AppHandle, service: String, model: String, key: String, mode: String) -> Result<(), String> {
+pub async fn launch_service(app: tauri::AppHandle, service: String, model: String, key: String, mode: String, models: Vec<HiveModel>) -> Result<(), String> {
   let model = model.trim();
   let key = key.trim();
   if model.is_empty() {
@@ -600,7 +600,7 @@ pub async fn launch_service(app: tauri::AppHandle, service: String, model: Strin
   match (service.as_str(), mode.as_str()) {
     ("opencode", "app") => launch_opencode_app(model, key),
     ("opencode", "terminal") => launch_opencode_cli(&app, model, key),
-    ("codex", "terminal") => launch_codex_cli(&app, model, key).await,
+    ("codex", "terminal") => launch_codex_cli(&app, model, key, &models).await,
     ("claude_code", "terminal") => launch_claude_cli(&app, model, key).await,
     _ => Err(format!("Avvio non valido: {service} in modalità {mode}")),
   }
@@ -612,8 +612,8 @@ const OPENCODE_PROVIDER_ID: &str = "requrv-hive";
 // keep conservative defaults: only the name in the client configs and a
 // 128k context window.
 const KNOWN_HIVE_MODEL: &str = "requrv-small-3.8";
-const KNOWN_HIVE_MODEL_CONTEXT: u32 = 200_000;
-const KNOWN_HIVE_MODEL_OUTPUT: u32 = 32_000;
+const KNOWN_HIVE_MODEL_CONTEXT: u32 = 262_144;
+const KNOWN_HIVE_MODEL_OUTPUT: u32 = 32_768;
 const KNOWN_HIVE_MODEL_INPUTS: [&str; 3] = ["text", "image", "video"];
 const KNOWN_HIVE_MODEL_OUTPUTS: [&str; 1] = ["text"];
 // Modalities the codex model catalog can express: `input_modalities` only
@@ -925,6 +925,57 @@ fn codex_auth_backup_path_in(home: &Path) -> PathBuf {
 
 fn codex_catalog_path_in(home: &Path) -> PathBuf {
   codex_dir_in(home).join(HIVE_CATALOG_FILE)
+}
+
+// Model catalog for the Codex CLI: separate file from the ChatGPT app's so
+// the app's restore (which removes its own catalog) never breaks the CLI.
+const HIVE_CLI_CATALOG_FILE: &str = "hive-cli-models.json";
+
+fn codex_cli_catalog_path_in(home: &Path) -> PathBuf {
+  codex_dir_in(home).join(HIVE_CLI_CATALOG_FILE)
+}
+
+// model_catalog_json requires Codex >= 0.134.0; older CLIs fail to start
+// with an opaque config error, so check the version up front.
+const CODEX_MIN_VERSION: &str = "0.134.0";
+
+fn codex_version_ok(version: &str) -> bool {
+  !version.is_empty()
+    && compare_versions(version, CODEX_MIN_VERSION) >= std::cmp::Ordering::Equal
+}
+
+fn check_codex_version(bin: &Path) -> Result<(), String> {
+  let output = Command::new(bin)
+    .arg("--version")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .map_err(|e| format!("Impossibile verificare la versione di Codex: {e}"))?;
+  let out = String::from_utf8_lossy(&output.stdout);
+  // Output looks like "codex-cli 0.87.0"; the version is the last field.
+  let version = out
+    .split_whitespace()
+    .last()
+    .map(str::to_string)
+    .unwrap_or_default();
+  if !codex_version_ok(&version) {
+    return Err(format!(
+      "Codex {version} è troppo vecchio: serve almeno {CODEX_MIN_VERSION}. Aggiorna con: npm update -g @openai/codex"
+    ));
+  }
+  Ok(())
+}
+
+// Dedicated CLI profile: the catalog (context window, modalities, reasoning
+// levels) travels with the profile so `codex --profile hive` works even when
+// the root config belongs to the ChatGPT app.
+fn render_codex_cli_profile(model: &str, catalog_path: &Path) -> String {
+  format!(
+    "model = \"{model}\"\nmodel_provider = \"hive\"\nmodel_catalog_json = \"{catalog}\"\n\n[model_providers.hive]\nname = \"ReQurv AI Hive\"\nbase_url = \"{base}\"\nwire_api = \"responses\"\nenv_key = \"HIVE_API_KEY\"\n",
+    catalog = catalog_path.to_string_lossy(),
+    base = HIVE_OPENAI_BASE_URL,
+  )
 }
 
 // The catalog schema takes each reasoning level as a `ReasoningEffortPreset`
@@ -1324,10 +1375,12 @@ pub fn restore_chatgpt_app(app: tauri::AppHandle) -> Result<AppRestartResult, St
 // setting sources); custom gateways are an enterprise-only ("3p") feature that
 // is disabled in consumer builds. So Claude Code is terminal-only here.
 
-async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str) -> Result<(), String> {
+async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str, models: &[HiveModel]) -> Result<(), String> {
   let bin = find_service_binary("codex")
     .or_else(codex_app_binary)
     .ok_or_else(|| String::from("Codex non è installato. Scaricalo da https://chatgpt.com/codex."))?;
+
+  check_codex_version(&bin)?;
 
   assert_responses_available(key).await?;
 
@@ -1341,10 +1394,17 @@ async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str) -> Res
     let _ = std::fs::write(profile_path.with_extension("toml.bak"), old);
   }
 
-  let profile = format!(
-    "model = \"{model}\"\nmodel_provider = \"hive\"\n\n[model_providers.hive]\nname = \"ReQurv AI Hive\"\nbase_url = \"{base}\"\nwire_api = \"responses\"\nenv_key = \"HIVE_API_KEY\"\n",
-    base = HIVE_OPENAI_BASE_URL,
+  // The catalog tells Codex the real context window, input modalities and
+  // reasoning levels of the Hive models (without it the CLI assumes
+  // conservative defaults and the model is missing from /models).
+  let catalog_path = codex_cli_catalog_path_in(
+    &home_dir().ok_or_else(|| "Home directory non trovata".to_string())?,
   );
+  let catalog = build_hive_catalog(models);
+  let rendered = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
+  std::fs::write(&catalog_path, rendered + "\n").map_err(|e| e.to_string())?;
+
+  let profile = render_codex_cli_profile(model, &catalog_path);
   std::fs::write(&profile_path, profile).map_err(|e| e.to_string())?;
 
   let args = vec!["--profile".to_string(), "hive".to_string()];
@@ -1361,11 +1421,18 @@ async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str) -> Res
 // Agent mode uses, because both run the Claude Agent SDK. The context window
 // is the real limit for the known model (conservative default otherwise):
 // the model is not in the client's catalog, so auto-compact would assume 200k.
+// Every model tier (opus/sonnet/haiku) and the subagent model are pinned to
+// the selected Hive model: otherwise Claude Code sends its internal claude-*
+// defaults for background work and subagents, which the gateway does not know.
 fn claude_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
   vec![
     ("ANTHROPIC_BASE_URL", HIVE_ANTHROPIC_BASE_URL.to_string()),
     ("ANTHROPIC_API_KEY", key.to_string()),
     ("ANTHROPIC_MODEL", model.to_string()),
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_string()),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_string()),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
     ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", hive_model_context(model).to_string()),
   ]
 }
@@ -1501,6 +1568,13 @@ fn hermes_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
     ("ANTHROPIC_BASE_URL", HIVE_ANTHROPIC_BASE_URL.to_string()),
     ("ANTHROPIC_API_KEY", key.to_string()),
     ("ANTHROPIC_MODEL", model.to_string()),
+    // Pin every model tier and the subagent model like Claude Code: the
+    // Agent SDK otherwise falls back to internal claude-* defaults that the
+    // gateway does not know.
+    ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_string()),
+    ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_string()),
+    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
     // The model is not in the client's catalog: pin its context window (real
     // limit for the known model, conservative default otherwise) instead of
     // letting auto-compact assume 200k.
@@ -1998,22 +2072,33 @@ mod tests {
     assert_eq!(map.get("ANTHROPIC_BASE_URL"), Some(&HIVE_ANTHROPIC_BASE_URL.to_string()));
     assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"requrv_sk_test".to_string()));
     assert_eq!(map.get("ANTHROPIC_MODEL"), Some(&"model-a".to_string()));
+    // Every tier and the subagent model are pinned to the selected model so
+    // the Agent SDK never falls back to internal claude-* defaults.
+    assert_eq!(map.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some(&"model-a".to_string()));
+    assert_eq!(map.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some(&"model-a".to_string()));
+    assert_eq!(map.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some(&"model-a".to_string()));
+    assert_eq!(map.get("CLAUDE_CODE_SUBAGENT_MODEL"), Some(&"model-a".to_string()));
     assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"128000".to_string()));
-    assert_eq!(map.len(), 4);
+    assert_eq!(map.len(), 8);
   }
 
   #[test]
   fn hermes_env_uses_real_context_for_known_model() {
     let env = hermes_hive_env("requrv-small-3.8", "requrv_sk_test");
     let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"200000".to_string()));
+    assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"262144".to_string()));
   }
 
   #[test]
   fn claude_env_pins_context_per_model() {
     let env = claude_hive_env("requrv-small-3.8", "requrv_sk_test");
     let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"200000".to_string()));
+    assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"262144".to_string()));
+    // All model tiers point at the selected model, not claude-* defaults.
+    assert_eq!(map.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some(&"requrv-small-3.8".to_string()));
+    assert_eq!(map.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some(&"requrv-small-3.8".to_string()));
+    assert_eq!(map.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some(&"requrv-small-3.8".to_string()));
+    assert_eq!(map.get("CLAUDE_CODE_SUBAGENT_MODEL"), Some(&"requrv-small-3.8".to_string()));
     let env = claude_hive_env("model-a", "requrv_sk_test");
     let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
     assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"128000".to_string()));
@@ -2166,8 +2251,8 @@ mod tests {
     assert_eq!(provider["options"]["apiKey"], "requrv_sk_test");
     let entry = &provider["models"]["requrv-small-3.8"];
     assert_eq!(entry["name"], "requrv-small-3.8");
-    assert_eq!(entry["limit"]["context"], 200_000);
-    assert_eq!(entry["limit"]["output"], 32_000);
+    assert_eq!(entry["limit"]["context"], 262_144);
+    assert_eq!(entry["limit"]["output"], 32_768);
     assert_eq!(entry["modalities"]["input"], serde_json::json!(["text", "image", "video"]));
     assert_eq!(entry["modalities"]["output"], serde_json::json!(["text"]));
     assert_eq!(entry["options"]["reasoningEffort"], "medium");
@@ -2346,8 +2431,8 @@ mod tests {
     }];
     let catalog = build_hive_catalog(&models);
     let entry = &catalog["models"][0];
-    assert_eq!(entry["context_window"], 200_000);
-    assert_eq!(entry["max_context_window"], 200_000);
+    assert_eq!(entry["context_window"], 262_144);
+    assert_eq!(entry["max_context_window"], 262_144);
     // Video is a Hive modality but not a codex one: the catalog drops it.
     assert_eq!(entry["input_modalities"], serde_json::json!(["text", "image"]));
     assert_eq!(entry["default_reasoning_level"], "xhigh");
@@ -2360,6 +2445,32 @@ mod tests {
         { "effort": "xhigh", "description": "Extra high reasoning depth for complex problems" }
       ])
     );
+  }
+
+  // Il profilo CLI porta il catalogo (finestra di contesto, modalità,
+  // livelli di reasoning) perché il CLI non legge la config radice dell'app.
+  #[test]
+  fn codex_cli_profile_pins_model_provider_and_catalog() {
+    let profile = render_codex_cli_profile("requrv-small-3.8", Path::new("/home/x/.codex/hive-cli-models.json"));
+    assert!(profile.contains("model = \"requrv-small-3.8\""));
+    assert!(profile.contains("model_provider = \"hive\""));
+    assert!(profile.contains("model_catalog_json = \"/home/x/.codex/hive-cli-models.json\""));
+    assert!(profile.contains("[model_providers.hive]"));
+    assert!(profile.contains(&format!("base_url = \"{HIVE_OPENAI_BASE_URL}\"")));
+    assert!(profile.contains("wire_api = \"responses\""));
+    assert!(profile.contains("env_key = \"HIVE_API_KEY\""));
+  }
+
+  // model_catalog_json esiste da Codex 0.134.0: sotto, il CLI parte con un
+  // errore di config opaco, quindi il launcher blocca prima.
+  #[test]
+  fn codex_version_gate_accepts_only_new_enough_clis() {
+    assert!(!codex_version_ok(""));
+    assert!(!codex_version_ok("0.133.9"));
+    assert!(!codex_version_ok("0.99.0"));
+    assert!(codex_version_ok("0.134.0"));
+    assert!(codex_version_ok("0.140.2"));
+    assert!(codex_version_ok("1.0.0"));
   }
 
   #[test]

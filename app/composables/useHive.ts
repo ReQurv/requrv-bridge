@@ -278,7 +278,8 @@ export function useHive() {
         service,
         model: selectedModel.value,
         key: key.value.trim(),
-        mode
+        mode,
+        models: chatModels.value
       })
       toast.add({
         title: `${SERVICE_META[service].title} avviato`,
