@@ -3,6 +3,40 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::Manager;
 
+// Local development override: a hive.env file in the app config dir may set
+// the HIVE_* base URLs (KEY=VALUE lines, '#' comments); real environment
+// variables win, and without the file the production defaults apply.
+const LOCAL_ENV_FILE_NAME: &str = "hive.env";
+
+fn local_env_entries(content: &str) -> Vec<(&str, &str)> {
+  content
+    .lines()
+    .filter_map(|line| {
+      let line = line.trim();
+      if line.is_empty() || line.starts_with('#') {
+        return None;
+      }
+      let (name, value) = line.split_once('=')?;
+      let (name, value) = (name.trim(), value.trim().trim_matches('"'));
+      name.starts_with("HIVE_").then_some((name, value))
+    })
+    .collect()
+}
+
+pub fn load_local_env_file(app: &tauri::AppHandle) {
+  let Ok(dir) = app.path().app_config_dir() else {
+    return;
+  };
+  let Ok(content) = std::fs::read_to_string(dir.join(LOCAL_ENV_FILE_NAME)) else {
+    return;
+  };
+  for (name, value) in local_env_entries(&content) {
+    if std::env::var(name).is_err() {
+      std::env::set_var(name, value);
+    }
+  }
+}
+
 // Base URLs are overridable via environment variables so the whole app can
 // be pointed at a local requrv-proxy instance during development; the
 // defaults are the production AI Hive gateway.
@@ -2362,6 +2396,20 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateInfo, Stri
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn parses_local_env_file() {
+    let entries = local_env_entries(
+      "# local overrides\n\nHIVE_OPENAI_BASE_URL=http://localhost:3000/api/v1\nOTHER=ignored\nHIVE_ANTHROPIC_BASE_URL = \"http://localhost:3000/api\"\n",
+    );
+    assert_eq!(
+      entries,
+      vec![
+        ("HIVE_OPENAI_BASE_URL", "http://localhost:3000/api/v1"),
+        ("HIVE_ANTHROPIC_BASE_URL", "http://localhost:3000/api"),
+      ]
+    );
+  }
 
   #[test]
   fn finds_opencode_if_installed() {

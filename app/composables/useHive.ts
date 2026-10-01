@@ -162,8 +162,8 @@ export function useHive() {
     }
   }
 
-  async function loadModels() {
-    if (!key.value.trim()) return
+  async function loadModels(): Promise<boolean> {
+    if (!key.value.trim()) return false
     try {
       models.value = await invoke<HiveModel[]>('list_hive_models', {
         key: key.value.trim()
@@ -172,12 +172,14 @@ export function useHive() {
       if (first && !chatModelIds.value.includes(selectedModel.value)) {
         selectedModel.value = first
       }
+      return true
     } catch (error) {
       toast.add({
         title: 'Impossibile caricare i modelli da AI Hive',
         description: String(error),
         color: 'error'
       })
+      return false
     }
   }
 
@@ -189,7 +191,9 @@ export function useHive() {
       await invoke('set_hive_key', { key: trimmed })
       key.value = trimmed
       keySaved.value = true
-      await loadModels()
+      if (!(await loadModels())) {
+        return false
+      }
       toast.add({
         title: 'Chiave salvata e verificata',
         description: `${models.value.length} modelli disponibili su AI Hive.`,
