@@ -3,10 +3,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::Manager;
 
-pub const HIVE_OPENAI_BASE_URL: &str = "https://hive.requrv.ai/api/v1";
+// Base URLs are overridable via environment variables so the whole app can
+// be pointed at a local requrv-proxy instance during development; the
+// defaults are the production AI Hive gateway.
+fn hive_base_url(env_key: &str, default: &str) -> String {
+  std::env::var(env_key)
+    .ok()
+    .filter(|v| !v.trim().is_empty())
+    .unwrap_or_else(|| default.to_string())
+}
+
+pub fn hive_openai_base_url() -> String {
+  hive_base_url("HIVE_OPENAI_BASE_URL", "https://hive.requrv.ai/api/v1")
+}
+
 // Claude Code speaks the Anthropic Messages API and appends /v1/messages to
 // ANTHROPIC_BASE_URL, so the base is the gateway without the trailing /v1.
-pub const HIVE_ANTHROPIC_BASE_URL: &str = "https://hive.requrv.ai/api";
+pub fn hive_anthropic_base_url() -> String {
+  hive_base_url("HIVE_ANTHROPIC_BASE_URL", "https://hive.requrv.ai/api")
+}
+
+// Claude Desktop 3p gateway: claude-* slot IDs resolve to real models here.
+pub fn hive_claude_gateway_base_url() -> String {
+  hive_base_url("HIVE_CLAUDE_GATEWAY_BASE_URL", "https://hive.requrv.ai/api/claude")
+}
 // Le release pubbliche dell'app: la più recente è la candidata aggiornamento.
 pub const GITHUB_LATEST_RELEASE_URL: &str =
   "https://api.github.com/repos/ReQurv/requrv-launch/releases/latest";
@@ -66,7 +86,7 @@ pub struct HiveModel {
 #[tauri::command]
 pub async fn list_hive_models(key: String) -> Result<Vec<HiveModel>, String> {
   let client = reqwest::Client::new();
-  let url = format!("{HIVE_OPENAI_BASE_URL}/models");
+  let url = format!("{}/models", hive_openai_base_url());
   let response = client
     .get(&url)
     .bearer_auth(key.trim())
@@ -132,7 +152,7 @@ fn probe_error(status: reqwest::StatusCode, agent: &str, endpoint: &str) -> Opti
 // broken TUI.
 async fn assert_endpoint_available(key: &str, endpoint: &str, agent: &str) -> Result<(), String> {
   let client = reqwest::Client::new();
-  let url = format!("{HIVE_OPENAI_BASE_URL}{endpoint}");
+  let url = format!("{}{endpoint}", hive_openai_base_url());
   let response = client
     .post(&url)
     .bearer_auth(key.trim())
@@ -774,7 +794,7 @@ fn merge_hive_provider(config: &mut serde_json::Value, model: &str, key: &str) {
     "npm": "@ai-sdk/openai-compatible",
     "name": "ReQurv Hive",
     "options": {
-      "baseURL": HIVE_OPENAI_BASE_URL,
+      "baseURL": hive_openai_base_url(),
       "apiKey": key,
     },
     "models": {
@@ -982,7 +1002,7 @@ fn render_codex_cli_profile(model: &str, catalog_path: &Path) -> String {
   format!(
     "model = \"{model}\"\nmodel_provider = \"hive\"\nmodel_catalog_json = \"{catalog}\"\n\n[model_providers.hive]\nname = \"ReQurv AI Hive\"\nbase_url = \"{base}\"\nwire_api = \"responses\"\nenv_key = \"HIVE_API_KEY\"\n",
     catalog = catalog_path.to_string_lossy(),
-    base = HIVE_OPENAI_BASE_URL,
+    base = hive_openai_base_url(),
   )
 }
 
@@ -1084,10 +1104,10 @@ fn hive_provider_table(table: &toml::Table) -> Option<&toml::Table> {
 
 // True when the provider (or its legacy root openai_base_url) points at AI Hive.
 fn hive_config_ours(table: &toml::Table) -> bool {
-  table.get("openai_base_url").and_then(|v| v.as_str()) == Some(HIVE_OPENAI_BASE_URL)
+  table.get("openai_base_url").and_then(|v| v.as_str()) == Some(hive_openai_base_url().as_str())
     || hive_provider_table(table)
       .and_then(|p| p.get("base_url").and_then(|v| v.as_str()))
-      == Some(HIVE_OPENAI_BASE_URL)
+      == Some(hive_openai_base_url().as_str())
 }
 
 // True when the codex config is pointed at AI Hive by this launcher.
@@ -1140,7 +1160,7 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
   table.remove("openai_base_url");
   let mut provider = toml::Table::new();
   provider.insert("name".into(), toml::Value::String("ReQurv AI Hive".into()));
-  provider.insert("base_url".into(), toml::Value::String(HIVE_OPENAI_BASE_URL.into()));
+  provider.insert("base_url".into(), toml::Value::String(hive_openai_base_url()));
   provider.insert("wire_api".into(), toml::Value::String("responses".into()));
   provider.insert("supports_websockets".into(), toml::Value::Boolean(false));
   provider.insert("experimental_bearer_token".into(), toml::Value::String(key.to_string()));
@@ -1215,7 +1235,7 @@ fn restore_chatgpt_app_in(home: &Path, key: &str) -> Result<(), String> {
             .get(HIVE_PROVIDER_ID)
             .and_then(|p| p.as_table())
             .and_then(|p| p.get("base_url").and_then(|v| v.as_str()))
-            == Some(HIVE_OPENAI_BASE_URL);
+            == Some(hive_openai_base_url().as_str());
           if ours {
             providers.remove(HIVE_PROVIDER_ID);
           }
@@ -1377,14 +1397,13 @@ pub fn restore_chatgpt_app(app: tauri::AppHandle) -> Result<AppRestartResult, St
 }
 
 // ---------------------------------------------------------------------------
-// Claude Desktop su AI Hive (PoC: gateway locale)
+// Claude Desktop su AI Hive
 // ---------------------------------------------------------------------------
 // Third-party ("3p") deployment mode: the managed profile in configLibrary
 // declares the gateway URL, credential and model rows; the app sends the
 // claude-* slot to POST /v1/messages and the gateway resolves it to the real
-// model. PoC: base URL points at the local proxy; production is
-// https://hive.requrv.ai/api/claude.
-const HIVE_CLAUDE_GATEWAY_BASE_URL: &str = "http://localhost:3000/api/claude";
+// model. The gateway base URL is configurable via HIVE_CLAUDE_GATEWAY_BASE_URL
+// (see hive_claude_gateway_base_url); the default is the production gateway.
 // Fixed profile id (same convention as Ollama's launcher); opaque to the app.
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000000114";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "ReQurv AI Hive";
@@ -1478,7 +1497,7 @@ fn claude_desktop_profile_value(model: &str, key: &str) -> serde_json::Value {
     "inferenceCredentialKind": "static",
     "inferenceGatewayApiKey": key,
     "inferenceGatewayAuthScheme": "x-api-key",
-    "inferenceGatewayBaseUrl": HIVE_CLAUDE_GATEWAY_BASE_URL,
+    "inferenceGatewayBaseUrl": hive_claude_gateway_base_url(),
     "inferenceModels": [{
       "name": CLAUDE_DESKTOP_SLOT,
       "labelOverride": format!("{model} (ReQurv)"),
@@ -1502,7 +1521,7 @@ fn claude_desktop_configured_in(home: &Path) -> bool {
   let Ok(profile) = read_json_allow_missing(&paths.profile) else {
     return false;
   };
-  profile.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(HIVE_CLAUDE_GATEWAY_BASE_URL))
+  profile.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_claude_gateway_base_url()))
 }
 
 fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
@@ -1586,7 +1605,7 @@ fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
 fn claude_desktop_our_profile(path: &Path) -> bool {
   read_json_allow_missing(path)
     .map(|p| {
-      p.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(HIVE_CLAUDE_GATEWAY_BASE_URL))
+      p.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_claude_gateway_base_url()))
     })
     .unwrap_or(false)
 }
@@ -1595,7 +1614,7 @@ fn claude_desktop_our_profile(path: &Path) -> bool {
 // app's profile, otherwise Claude Desktop would be left without a working
 // model.
 async fn assert_claude_gateway_available(key: &str) -> Result<(), String> {
-  let url = format!("{HIVE_CLAUDE_GATEWAY_BASE_URL}/v1/models");
+  let url = format!("{}/v1/models", hive_claude_gateway_base_url());
   let response = reqwest::Client::new()
     .get(&url)
     .header("x-api-key", key.trim())
@@ -1780,7 +1799,7 @@ async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str, models
 // defaults for background work and subagents, which the gateway does not know.
 fn claude_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
   vec![
-    ("ANTHROPIC_BASE_URL", HIVE_ANTHROPIC_BASE_URL.to_string()),
+    ("ANTHROPIC_BASE_URL", hive_anthropic_base_url()),
     ("ANTHROPIC_API_KEY", key.to_string()),
     ("ANTHROPIC_MODEL", model.to_string()),
     ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_string()),
@@ -1919,7 +1938,7 @@ fn hermes_app_running() -> bool {
 // Claude Code CLI uses, because the Agent mode runs the Claude Agent SDK.
 fn hermes_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
   vec![
-    ("ANTHROPIC_BASE_URL", HIVE_ANTHROPIC_BASE_URL.to_string()),
+    ("ANTHROPIC_BASE_URL", hive_anthropic_base_url()),
     ("ANTHROPIC_API_KEY", key.to_string()),
     ("ANTHROPIC_MODEL", model.to_string()),
     // Pin every model tier and the subagent model like Claude Code: the
@@ -2399,17 +2418,18 @@ mod tests {
   // con le variabili d'ambiente, senza toccare ~/.claude.
   #[test]
   fn builds_claude_terminal_script() {
+    let anthropic_base = hive_anthropic_base_url();
     let script = build_terminal_script(
       Path::new("/Users/x/.local/bin/claude"),
       &[],
       &[
-        ("ANTHROPIC_BASE_URL", HIVE_ANTHROPIC_BASE_URL),
+        ("ANTHROPIC_BASE_URL", anthropic_base.as_str()),
         ("ANTHROPIC_API_KEY", "sk-test"),
         ("ANTHROPIC_MODEL", "model-a"),
         ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "128000"),
       ],
     );
-    assert!(script.contains("export ANTHROPIC_BASE_URL='https://hive.requrv.ai/api'"));
+    assert!(script.contains(&format!("export ANTHROPIC_BASE_URL='{anthropic_base}'")));
     assert!(script.contains("export ANTHROPIC_API_KEY='sk-test'"));
     assert!(script.contains("export ANTHROPIC_MODEL='model-a'"));
     assert!(script.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS='128000'"));
@@ -2423,7 +2443,7 @@ mod tests {
   fn builds_hermes_hive_env() {
     let env = hermes_hive_env("model-a", "requrv_sk_test");
     let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("ANTHROPIC_BASE_URL"), Some(&HIVE_ANTHROPIC_BASE_URL.to_string()));
+    assert_eq!(map.get("ANTHROPIC_BASE_URL"), Some(&hive_anthropic_base_url()));
     assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"requrv_sk_test".to_string()));
     assert_eq!(map.get("ANTHROPIC_MODEL"), Some(&"model-a".to_string()));
     // Every tier and the subagent model are pinned to the selected model so
@@ -2601,7 +2621,7 @@ mod tests {
     let provider = &config["provider"]["requrv-hive"];
     assert_eq!(provider["npm"], "@ai-sdk/openai-compatible");
     assert_eq!(provider["name"], "ReQurv Hive");
-    assert_eq!(provider["options"]["baseURL"], HIVE_OPENAI_BASE_URL);
+    assert_eq!(provider["options"]["baseURL"], hive_openai_base_url().as_str());
     assert_eq!(provider["options"]["apiKey"], "requrv_sk_test");
     let entry = &provider["models"]["requrv-small-3.8"];
     assert_eq!(entry["name"], "requrv-small-3.8");
@@ -2810,7 +2830,7 @@ mod tests {
     assert!(profile.contains("model_provider = \"hive\""));
     assert!(profile.contains("model_catalog_json = \"/home/x/.codex/hive-cli-models.json\""));
     assert!(profile.contains("[model_providers.hive]"));
-    assert!(profile.contains(&format!("base_url = \"{HIVE_OPENAI_BASE_URL}\"")));
+    assert!(profile.contains(&format!("base_url = \"{}\"", hive_openai_base_url())));
     assert!(profile.contains("wire_api = \"responses\""));
     assert!(profile.contains("env_key = \"HIVE_API_KEY\""));
   }
@@ -2840,7 +2860,8 @@ mod tests {
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let original_config = format!(
-      "model = \"gpt-5-codex\"\nnotify = [\"bar\"]\nopenai_base_url = \"{HIVE_OPENAI_BASE_URL}\"\n[desktop]\ntheme = \"dark\"\n"
+      "model = \"gpt-5-codex\"\nnotify = [\"bar\"]\nopenai_base_url = \"{}\"\n[desktop]\ntheme = \"dark\"\n",
+      hive_openai_base_url()
     );
     let original_auth = r#"{"auth_mode": "chatgpt"}"#;
     std::fs::write(dir.join("config.toml"), original_config.as_str()).expect("write config");
@@ -2866,7 +2887,7 @@ mod tests {
       .and_then(|p| p.get(HIVE_PROVIDER_ID))
       .and_then(|v| v.as_table())
       .expect("hive provider table");
-    assert_eq!(provider.get("base_url").and_then(|v| v.as_str()), Some(HIVE_OPENAI_BASE_URL));
+    assert_eq!(provider.get("base_url").and_then(|v| v.as_str()), Some(hive_openai_base_url().as_str()));
     assert_eq!(provider.get("wire_api").and_then(|v| v.as_str()), Some("responses"));
     assert_eq!(provider.get("supports_websockets").and_then(|v| v.as_bool()), Some(false));
     assert_eq!(
@@ -2951,7 +2972,8 @@ mod tests {
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let configured = format!(
-      "model = \"model-a\"\nnotify = [\"bar\"]\nopenai_base_url = \"{HIVE_OPENAI_BASE_URL}\"\nmodel_catalog_json = \"{}\"\n",
+      "model = \"model-a\"\nnotify = [\"bar\"]\nopenai_base_url = \"{}\"\nmodel_catalog_json = \"{}\"\n",
+      hive_openai_base_url(),
       dir.join("hive-models.json").display()
     );
     std::fs::write(dir.join("config.toml"), configured).expect("write config");
@@ -2976,8 +2998,9 @@ mod tests {
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let configured = format!(
-      "model = \"model-a\"\nnotify = [\"bar\"]\nmodel_provider = \"{HIVE_PROVIDER_ID}\"\nmodel_catalog_json = \"{}\"\n\n[model_providers.{HIVE_PROVIDER_ID}]\nbase_url = \"{HIVE_OPENAI_BASE_URL}\"\nwire_api = \"responses\"\nsupports_websockets = false\n\n[model_providers.other]\nbase_url = \"https://example.com/v1\"\n",
-      dir.join("hive-models.json").display()
+      "model = \"model-a\"\nnotify = [\"bar\"]\nmodel_provider = \"{HIVE_PROVIDER_ID}\"\nmodel_catalog_json = \"{}\"\n\n[model_providers.{HIVE_PROVIDER_ID}]\nbase_url = \"{}\"\nwire_api = \"responses\"\nsupports_websockets = false\n\n[model_providers.other]\nbase_url = \"https://example.com/v1\"\n",
+      dir.join("hive-models.json").display(),
+      hive_openai_base_url()
     );
     std::fs::write(dir.join("config.toml"), configured).expect("write config");
 
@@ -3002,7 +3025,7 @@ mod tests {
     let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-auth-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    let configured = format!("model = \"model-a\"\nopenai_base_url = \"{HIVE_OPENAI_BASE_URL}\"\n");
+    let configured = format!("model = \"model-a\"\nopenai_base_url = \"{}\"\n", hive_openai_base_url());
     std::fs::write(dir.join("config.toml"), configured).expect("write config");
     let foreign_auth = r#"{"OPENAI_API_KEY": "sk-altra-chiave", "auth_mode": "apikey"}"#;
     std::fs::write(dir.join("auth.json"), foreign_auth).expect("write auth");
@@ -3085,7 +3108,7 @@ mod tests {
     )
     .unwrap();
     assert_eq!(profile["inferenceProvider"], "gateway");
-    assert_eq!(profile["inferenceGatewayBaseUrl"], HIVE_CLAUDE_GATEWAY_BASE_URL);
+    assert_eq!(profile["inferenceGatewayBaseUrl"], hive_claude_gateway_base_url().as_str());
     assert_eq!(profile["inferenceGatewayApiKey"], "requrv_sk_test");
     assert_eq!(profile["inferenceModels"][0]["name"], CLAUDE_DESKTOP_SLOT);
     assert_eq!(
