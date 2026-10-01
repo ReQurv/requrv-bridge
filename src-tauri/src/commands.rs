@@ -1368,12 +1368,369 @@ pub fn restore_chatgpt_app(app: tauri::AppHandle) -> Result<AppRestartResult, St
   })
 }
 
-// Note on Claude Desktop: unlike ChatGPT.app, the Claude desktop app cannot be
-// pointed at AI Hive. Its Code tab runs cloud sessions authenticated with the
-// claude.ai account (CLAUDE_CODE_OAUTH_TOKEN, subscription-scoped model
-// catalog) and ignores ~/.claude/settings.json (the SDK is launched with empty
-// setting sources); custom gateways are an enterprise-only ("3p") feature that
-// is disabled in consumer builds. So Claude Code is terminal-only here.
+// ---------------------------------------------------------------------------
+// Claude Desktop su AI Hive (PoC: gateway locale)
+// ---------------------------------------------------------------------------
+// Claude Desktop's third-party ("3p") deployment mode points the app at a
+// gateway that speaks the Anthropic Messages protocol. The managed profile
+// (configLibrary/<uuid>.json) declares the gateway URL, the credential and
+// the model rows shown in the picker: the app sends the claude-* slot name
+// to POST /v1/messages and the gateway resolves it to the real model.
+//
+// PoC: the gateway base URL points at the local requrv-proxy dev server
+// (bun dev, port 3000) which mounts the Claude gateway at /api/claude. For
+// production this becomes https://hive.requrv.ai/api/claude once the proxy
+// changes are deployed.
+const HIVE_CLAUDE_GATEWAY_BASE_URL: &str = "http://localhost:3000/api/claude";
+// Fixed profile id used by the managed Claude profile (same convention as
+// Ollama's launcher); the app treats it as an opaque identifier.
+const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000000114";
+const CLAUDE_DESKTOP_PROFILE_NAME: &str = "ReQurv AI Hive";
+// The claude-* slot the app puts on the wire; the gateway maps it to the
+// model that owns the slot (LlmModel.claudeSlot).
+const CLAUDE_DESKTOP_SLOT: &str = "claude-sonnet-5";
+const CLAUDE_DESKTOP_BACKUP: &str = ".hive.bak";
+
+fn claude_desktop_app_path() -> Option<PathBuf> {
+  let candidates = [
+    PathBuf::from("/Applications/Claude.app"),
+    home_dir()?.join("Applications/Claude.app"),
+  ];
+  candidates.into_iter().find(|p| p.is_dir())
+}
+
+struct ClaudeDesktopPaths {
+  // The "normal" profile config: its deploymentMode selects which profile
+  // root the app boots into.
+  normal_config: PathBuf,
+  // The 3p profile root config (deploymentMode must be "3p" there too).
+  third_party_config: PathBuf,
+  // configLibrary metadata: appliedId selects the active profile.
+  meta: PathBuf,
+  // The managed gateway profile itself.
+  profile: PathBuf,
+}
+
+fn claude_desktop_paths_in(home: &Path) -> ClaudeDesktopPaths {
+  let support = home.join("Library/Application Support");
+  let normal = support.join("Claude");
+  let third_party = support.join("Claude-3p");
+  let library = third_party.join("configLibrary");
+  ClaudeDesktopPaths {
+    normal_config: normal.join("claude_desktop_config.json"),
+    third_party_config: third_party.join("claude_desktop_config.json"),
+    meta: library.join("_meta.json"),
+    profile: library.join(format!("{CLAUDE_DESKTOP_PROFILE_ID}.json")),
+  }
+}
+
+// Back up a file once (the first .hive.bak wins) so restore always returns
+// to the pre-Hive state, even across repeated configure/restore cycles.
+fn backup_once(path: &Path) -> Result<(), String> {
+  if !path.exists() {
+    return Ok(());
+  }
+  let backup = path.with_file_name(format!(
+    "{}.{}",
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+    CLAUDE_DESKTOP_BACKUP
+  ));
+  if !backup.exists() {
+    std::fs::copy(path, &backup)
+      .map_err(|e| format!("Backup di {} non riuscito: {e}", path.display()))?;
+  }
+  Ok(())
+}
+
+fn read_json_allow_missing(path: &Path) -> Result<serde_json::Value, String> {
+  match std::fs::read_to_string(path) {
+    Ok(raw) => serde_json::from_str(&raw)
+      .map_err(|e| format!("{} non è JSON valido: {e}", path.display())),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+    Err(e) => Err(format!("Impossibile leggere {}: {e}", path.display())),
+  }
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  let rendered = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+  std::fs::write(path, rendered + "\n").map_err(|e| e.to_string())
+}
+
+fn set_deployment_mode(path: &Path, mode: &str) -> Result<(), String> {
+  let mut cfg = read_json_allow_missing(path)?;
+  if !cfg.is_object() {
+    return Err(format!("{} non è un oggetto JSON", path.display()));
+  }
+  cfg["deploymentMode"] = serde_json::json!(mode);
+  write_json(path, &cfg)
+}
+
+fn claude_desktop_profile_value(model: &str, key: &str) -> serde_json::Value {
+  serde_json::json!({
+    "inferenceProvider": "gateway",
+    "inferenceCredentialKind": "static",
+    "inferenceGatewayApiKey": key,
+    "inferenceGatewayAuthScheme": "x-api-key",
+    "inferenceGatewayBaseUrl": HIVE_CLAUDE_GATEWAY_BASE_URL,
+    "inferenceModels": [{
+      "name": CLAUDE_DESKTOP_SLOT,
+      "labelOverride": format!("{model} (ReQurv)"),
+      "anthropicFamilyTier": "sonnet",
+      "isFamilyDefault": true,
+      "maxEffort": "max"
+    }]
+  })
+}
+
+fn claude_desktop_meta_value() -> serde_json::Value {
+  serde_json::json!({
+    "entries": [{ "id": CLAUDE_DESKTOP_PROFILE_ID, "name": CLAUDE_DESKTOP_PROFILE_NAME }],
+    "appliedId": CLAUDE_DESKTOP_PROFILE_ID
+  })
+}
+
+// True when the applied profile is ours (right id + right gateway URL), so
+// the UI can offer the restore button.
+fn claude_desktop_configured_in(home: &Path) -> bool {
+  let paths = claude_desktop_paths_in(home);
+  let Ok(meta) = read_json_allow_missing(&paths.meta) else {
+    return false;
+  };
+  if meta.get("appliedId") != Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)) {
+    return false;
+  }
+  let Ok(profile) = read_json_allow_missing(&paths.profile) else {
+    return false;
+  };
+  profile.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(HIVE_CLAUDE_GATEWAY_BASE_URL))
+}
+
+fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
+  let paths = claude_desktop_paths_in(home);
+  for path in [
+    &paths.normal_config,
+    &paths.third_party_config,
+    &paths.meta,
+    &paths.profile,
+  ] {
+    backup_once(path)?;
+  }
+  set_deployment_mode(&paths.normal_config, "3p")?;
+  set_deployment_mode(&paths.third_party_config, "3p")?;
+  // Merge the managed entry into any existing meta instead of clobbering it:
+  // other 3p profiles (if present) must survive.
+  let mut meta = read_json_allow_missing(&paths.meta)?;
+  if !meta.is_object() {
+    meta = serde_json::json!({});
+  }
+  let entries = meta
+    .get_mut("entries")
+    .and_then(|e| e.as_array_mut())
+    .map(|entries| {
+      entries.retain(|e| e.get("id") != Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)));
+      entries.push(serde_json::json!({
+        "id": CLAUDE_DESKTOP_PROFILE_ID,
+        "name": CLAUDE_DESKTOP_PROFILE_NAME
+      }));
+    });
+  if entries.is_none() {
+    meta["entries"] = serde_json::json!([
+      { "id": CLAUDE_DESKTOP_PROFILE_ID, "name": CLAUDE_DESKTOP_PROFILE_NAME }
+    ]);
+  }
+  meta["appliedId"] = serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID);
+  write_json(&paths.meta, &meta)?;
+  write_json(&paths.profile, &claude_desktop_profile_value(model, key))?;
+  Ok(())
+}
+
+fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
+  let paths = claude_desktop_paths_in(home);
+  // Restore every backup taken at configure time.
+  for path in [
+    &paths.normal_config,
+    &paths.third_party_config,
+    &paths.meta,
+    &paths.profile,
+  ] {
+    let backup = path.with_file_name(format!(
+      "{}.{}",
+      path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+      CLAUDE_DESKTOP_BACKUP
+    ));
+    if backup.exists() {
+      std::fs::copy(&backup, path)
+        .map_err(|e| format!("Ripristino di {} non riuscito: {e}", path.display()))?;
+      std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    }
+  }
+  // No backup (e.g. the profile was created from scratch): strip our managed
+  // state so the app falls back to its default profile.
+  if !paths.profile.exists() && claude_desktop_our_profile(&paths.profile) {
+    let _ = std::fs::remove_file(&paths.profile);
+  }
+  if paths.normal_config.exists() {
+    set_deployment_mode(&paths.normal_config, "1p")?;
+  }
+  if paths.third_party_config.exists() {
+    set_deployment_mode(&paths.third_party_config, "1p")?;
+  }
+  if paths.meta.exists() {
+    let mut meta = read_json_allow_missing(&paths.meta)?;
+    if let Some(entries) = meta.get_mut("entries").and_then(|e| e.as_array_mut()) {
+      entries.retain(|e| e.get("id") != Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)));
+    }
+    if meta.get("appliedId") == Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)) {
+      meta.as_object_mut().unwrap().remove("appliedId");
+    }
+    write_json(&paths.meta, &meta)?;
+  }
+  Ok(())
+}
+
+fn claude_desktop_our_profile(path: &Path) -> bool {
+  read_json_allow_missing(path)
+    .map(|p| {
+      p.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(HIVE_CLAUDE_GATEWAY_BASE_URL))
+    })
+    .unwrap_or(false)
+}
+
+// The gateway must be reachable and accept the key before we rewrite the
+// app's profile, otherwise Claude Desktop would be left without a working
+// model.
+async fn assert_claude_gateway_available(key: &str) -> Result<(), String> {
+  let url = format!("{HIVE_CLAUDE_GATEWAY_BASE_URL}/v1/models");
+  let response = reqwest::Client::new()
+    .get(&url)
+    .header("x-api-key", key.trim())
+    .timeout(std::time::Duration::from_secs(10))
+    .send()
+    .await
+    .map_err(|e| {
+      format!(
+        "Gateway Claude non raggiungibile su {url}: {e}. Avvia il proxy locale (bun dev) e riprova."
+      )
+    })?;
+  let status = response.status();
+  if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    return Err("Chiave Hive rifiutata dal gateway Claude (401/403).".into());
+  }
+  if !status.is_success() {
+    return Err(format!("Gateway Claude ha risposto con lo stato {status}"));
+  }
+  Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn claude_desktop_running() -> bool {
+  Command::new("pgrep")
+    .args(["-f", "Claude.app/Contents/MacOS/Claude"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn claude_desktop_running() -> bool {
+  false
+}
+
+#[cfg(target_os = "macos")]
+fn quit_claude_desktop() {
+  Command::new("osascript")
+    .args(["-e", "tell application \"Claude\" to quit"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .ok();
+  for _ in 0..20 {
+    if !claude_desktop_running() {
+      return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+  }
+  Command::new("pkill")
+    .args(["-f", "Claude.app/Contents/MacOS/Claude"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .ok();
+  for _ in 0..10 {
+    if !claude_desktop_running() {
+      return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+  }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn quit_claude_desktop() {}
+
+fn open_claude_desktop() -> Result<(), String> {
+  let bundle = claude_desktop_app_path()
+    .ok_or_else(|| String::from("Claude.app non trovato: installalo da https://claude.com/download."))?;
+  open_app_bundle(&bundle, "Claude.app")
+}
+
+// Claude persists its settings while shutting down: the profile must be
+// re-applied AFTER the process exits, otherwise its last write can restore
+// stale gateway values (same ordering as Ollama's launcher).
+fn restart_claude_desktop_with(model: &str, key: &str) -> Result<(), String> {
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  if claude_desktop_running() {
+    quit_claude_desktop();
+  }
+  configure_claude_desktop_in(&home, model, key)?;
+  open_claude_desktop()
+}
+
+// Point Claude Desktop at the local AI Hive gateway and report whether a
+// running instance needs a restart to load the new profile.
+#[tauri::command]
+pub async fn configure_claude_desktop(model: String, key: String) -> Result<AppRestartResult, String> {
+  let model = model.trim();
+  let key = key.trim();
+  if model.is_empty() {
+    return Err("Nessun modello selezionato".into());
+  }
+  if key.is_empty() {
+    return Err("Chiave Hive non salvata".into());
+  }
+  assert_claude_gateway_available(key).await?;
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  configure_claude_desktop_in(&home, model, key)?;
+  Ok(AppRestartResult {
+    restart_required: claude_desktop_running(),
+  })
+}
+
+#[tauri::command]
+pub fn restart_claude_desktop(model: String, key: String) -> Result<(), String> {
+  restart_claude_desktop_with(model.trim(), key.trim())
+}
+
+#[tauri::command]
+pub fn restore_claude_desktop() -> Result<AppRestartResult, String> {
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  restore_claude_desktop_in(&home)?;
+  Ok(AppRestartResult {
+    restart_required: claude_desktop_running(),
+  })
+}
+
+#[tauri::command]
+pub fn open_claude_desktop_app() -> Result<(), String> {
+  open_claude_desktop()
+}
 
 async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str, models: &[HiveModel]) -> Result<(), String> {
   let bin = find_service_binary("codex")
