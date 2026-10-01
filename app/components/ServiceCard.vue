@@ -8,12 +8,20 @@ const meta = computed(() => SERVICE_META[props.id])
 const installed = computed(() => status.value?.[props.id] ?? false)
 const canLaunch = computed(() => keySaved.value && !!selectedModel.value && installed.value)
 const needsSetup = computed(() => !keySaved.value || !selectedModel.value)
-const restoreConfigured = computed(
-  () => props.id === 'codex' && (status.value?.codex_app ?? false) && (status.value?.codex_app_configured ?? false)
-)
-const appLabel = computed(() => (props.id === 'claude_code' ? 'Claude' : 'ChatGPT'))
-const restoreBody = computed(
-  () => 'Vengono recuperati config.toml e auth.json pre-Hive e ChatGPT tornerà a usare l\'account OpenAI.'
+const restoreConfigured = computed(() => {
+  if (props.id === 'codex') {
+    return (status.value?.codex_app ?? false) && (status.value?.codex_app_configured ?? false)
+  }
+  if (props.id === 'claude_desktop') {
+    return (status.value?.claude_desktop_app ?? false) && (status.value?.claude_desktop_configured ?? false)
+  }
+  return false
+})
+const appLabel = computed(() => (props.id === 'claude_code' || props.id === 'claude_desktop' ? 'Claude' : 'ChatGPT'))
+const restoreBody = computed(() =>
+  props.id === 'claude_desktop'
+    ? 'Vengono recuperati i profili pre-Hive e Claude Desktop tornerà a usare l\'account Claude. Il modello Hive sparirà dal picker.'
+    : 'Vengono recuperati config.toml e auth.json pre-Hive e ChatGPT tornerà a usare l\'account OpenAI.'
 )
 const restoreModalOpen = ref(false)
 

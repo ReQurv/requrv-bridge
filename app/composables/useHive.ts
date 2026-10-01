@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
 
-export type ServiceId = 'opencode' | 'codex' | 'claude_code' | 'hermes'
+export type ServiceId = 'opencode' | 'codex' | 'claude_code' | 'hermes' | 'claude_desktop'
 export type LaunchMode = 'app' | 'terminal'
 
 export interface ServiceStatus {
@@ -16,6 +16,9 @@ export interface ServiceStatus {
   codex_app_configured: boolean
   claude_code_cli: boolean
   hermes_app: boolean
+  claude_desktop: boolean
+  claude_desktop_app: boolean
+  claude_desktop_configured: boolean
 }
 
 export interface AppRestartResult {
@@ -66,12 +69,19 @@ export const SERVICE_META: Record<
     description: 'IDE di coding con Agent su AI Hive: la configurazione passa come variabili d\'ambiente del processo, senza file di configurazione.',
     icon: 'i-simple-icons-hermes',
     downloadUrl: 'https://hermes-ide.com/download'
+  },
+  claude_desktop: {
+    title: 'Claude Desktop',
+    description: 'App desktop di Claude: profilo 3p puntato al gateway AI Hive, con il modello Hive nel picker al posto di Sonnet/Opus.',
+    icon: 'i-simple-icons-claude',
+    downloadUrl: 'https://claude.com/download'
   }
 }
 
 // Desktop app label shown in toasts and restart dialogs.
 const APP_LABELS: Partial<Record<ServiceId, string>> = {
-  codex: 'ChatGPT'
+  codex: 'ChatGPT',
+  claude_desktop: 'Claude'
 }
 
 const isTauri = computed(() => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window)
@@ -97,6 +107,9 @@ const launchTarget = ref<ServiceId | null>(null)
 const launchModalOpen = ref(false)
 const restartModalOpen = ref(false)
 const restartTarget = ref<ServiceId | null>(null)
+// The restart re-applies either the Hive profile (configure flow) or the
+// restored state (restore flow): Claude persists settings on shutdown.
+const restartAction = ref<'configure' | 'restore'>('configure')
 const restarting = ref(false)
 const restoring = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
@@ -214,11 +227,10 @@ export function useHive() {
   async function requestLaunch(service: ServiceId) {
     if (!key.value.trim() || !selectedModel.value || launching.value) return
     await refreshStatus()
-    // Claude Code is terminal-only: Claude Desktop cannot be pointed at AI
-    // Hive (cloud Code tab bound to the claude.ai account). Hermes is
-    // app-only: it has no CLI, so there is nothing to launch in a terminal.
+    // Claude Code is terminal-only. Hermes and Claude Desktop are app-only:
+    // they have no CLI, so there is nothing to launch in a terminal.
     const appAvailable = service === 'claude_code' ? false : status.value?.[`${service}_app`] ?? false
-    const terminalAvailable = service === 'hermes' ? false : status.value?.[`${service}_cli`] ?? false
+    const terminalAvailable = service === 'hermes' || service === 'claude_desktop' ? false : status.value?.[`${service}_cli`] ?? false
     if (appAvailable && terminalAvailable) {
       launchTarget.value = service
       launchModalOpen.value = true
@@ -274,6 +286,27 @@ export function useHive() {
         await refreshStatus()
         return
       }
+      if (service === 'claude_desktop') {
+        // Il profilo 3p viene scritto in configLibrary: un'istanza già aperta
+        // lo legge solo al riavvio, quindi si chiede il restart.
+        const result = await invoke<AppRestartResult>('configure_claude_desktop', {
+          model: selectedModel.value,
+          key: key.value.trim()
+        })
+        toast.add({
+          title: 'Claude Desktop configurato su AI Hive',
+          color: 'success'
+        })
+        if (result.restart_required) {
+          restartTarget.value = 'claude_desktop'
+          restartAction.value = 'configure'
+          restartModalOpen.value = true
+        } else {
+          await invoke('open_claude_desktop_app')
+        }
+        await refreshStatus()
+        return
+      }
       await invoke('launch_service', {
         service,
         model: selectedModel.value,
@@ -301,12 +334,21 @@ export function useHive() {
   async function confirmRestart() {
     const service = restartTarget.value
     restartModalOpen.value = false
-    if (!service || (service !== 'codex' && service !== 'hermes')) return
+    if (!service || (service !== 'codex' && service !== 'hermes' && service !== 'claude_desktop')) return
     const label = APP_LABELS[service] ?? SERVICE_META[service].title
     restarting.value = true
     try {
       if (service === 'codex') {
         await invoke('restart_chatgpt_app')
+      } else if (service === 'claude_desktop') {
+        if (restartAction.value === 'restore') {
+          await invoke('restart_claude_desktop_restored')
+        } else {
+          await invoke('restart_claude_desktop', {
+            model: selectedModel.value,
+            key: key.value.trim()
+          })
+        }
       } else {
         await invoke('restart_hermes_app', {
           model: selectedModel.value,
@@ -341,18 +383,21 @@ export function useHive() {
   }
 
   async function restoreApp(service: ServiceId) {
-    if (service !== 'codex') return
+    if (service !== 'codex' && service !== 'claude_desktop') return
     if (!isTauri.value || restoring.value) return
     restoring.value = true
     const label = APP_LABELS[service] ?? SERVICE_META[service].title
     try {
-      const result = await invoke<AppRestartResult>('restore_chatgpt_app')
+      const result = await invoke<AppRestartResult>(
+        service === 'codex' ? 'restore_chatgpt_app' : 'restore_claude_desktop'
+      )
       toast.add({
         title: `${label} ripristinato`,
         color: 'success'
       })
       if (result.restart_required) {
         restartTarget.value = service
+        restartAction.value = 'restore'
         restartModalOpen.value = true
       } else {
         await refreshStatus()

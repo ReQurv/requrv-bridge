@@ -17,6 +17,10 @@
         id="hermes"
         class="min-w-70 flex-1"
       />
+      <ServiceCard
+        id="claude_desktop"
+        class="min-w-70 flex-1"
+      />
     </div>
   </UPageSection>
 </template>

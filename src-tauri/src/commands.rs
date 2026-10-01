@@ -174,6 +174,9 @@ pub struct ServiceStatus {
   pub codex_app_configured: bool,
   pub claude_code_cli: bool,
   pub hermes_app: bool,
+  pub claude_desktop: bool,
+  pub claude_desktop_app: bool,
+  pub claude_desktop_configured: bool,
 }
 
 // Reports every launch target separately so the UI can offer the app/terminal
@@ -185,11 +188,14 @@ pub fn check_services() -> ServiceStatus {
   let codex_app = chatgpt_app_bundle().is_some();
   let codex_cli = find_service_binary("codex").is_some() || codex_app_binary().is_some();
   let codex_app_configured = home_dir().is_some_and(|home| chatgpt_app_configured_in(&home));
-  // Claude Code is terminal-only: Claude Desktop cannot be pointed at AI Hive
-  // (cloud Code tab bound to the claude.ai account), so only the CLI counts.
+  // Claude Code is terminal-only: see the Claude Desktop section for the
+  // 3p gateway integration (app-only, configured via configure_claude_desktop).
   let claude_code_cli = find_service_binary("claude").is_some();
   // Hermes is a desktop app without a CLI, so only the app counts.
   let hermes_app = hermes_app_path().is_some();
+  let claude_desktop_app = claude_desktop_app_path().is_some();
+  let claude_desktop_configured =
+    home_dir().is_some_and(|home| claude_desktop_configured_in(&home));
   ServiceStatus {
     opencode: opencode_app || opencode_cli,
     codex: codex_app || codex_cli,
@@ -202,6 +208,9 @@ pub fn check_services() -> ServiceStatus {
     codex_app_configured,
     claude_code_cli,
     hermes_app,
+    claude_desktop: claude_desktop_app,
+    claude_desktop_app,
+    claude_desktop_configured,
   }
 }
 
@@ -1389,7 +1398,7 @@ const CLAUDE_DESKTOP_PROFILE_NAME: &str = "ReQurv AI Hive";
 // The claude-* slot the app puts on the wire; the gateway maps it to the
 // model that owns the slot (LlmModel.claudeSlot).
 const CLAUDE_DESKTOP_SLOT: &str = "claude-sonnet-5";
-const CLAUDE_DESKTOP_BACKUP: &str = ".hive.bak";
+const CLAUDE_DESKTOP_BACKUP: &str = "hive.bak";
 
 fn claude_desktop_app_path() -> Option<PathBuf> {
   let candidates = [
@@ -1424,17 +1433,20 @@ fn claude_desktop_paths_in(home: &Path) -> ClaudeDesktopPaths {
   }
 }
 
+fn backup_path_for(path: &Path) -> PathBuf {
+  path.with_file_name(format!(
+    "{}.{}",
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+    CLAUDE_DESKTOP_BACKUP
+  ))
+}
 // Back up a file once (the first .hive.bak wins) so restore always returns
 // to the pre-Hive state, even across repeated configure/restore cycles.
 fn backup_once(path: &Path) -> Result<(), String> {
   if !path.exists() {
     return Ok(());
   }
-  let backup = path.with_file_name(format!(
-    "{}.{}",
-    path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-    CLAUDE_DESKTOP_BACKUP
-  ));
+  let backup = backup_path_for(path);
   if !backup.exists() {
     std::fs::copy(path, &backup)
       .map_err(|e| format!("Backup di {} non riuscito: {e}", path.display()))?;
@@ -1482,13 +1494,6 @@ fn claude_desktop_profile_value(model: &str, key: &str) -> serde_json::Value {
       "isFamilyDefault": true,
       "maxEffort": "max"
     }]
-  })
-}
-
-fn claude_desktop_meta_value() -> serde_json::Value {
-  serde_json::json!({
-    "entries": [{ "id": CLAUDE_DESKTOP_PROFILE_ID, "name": CLAUDE_DESKTOP_PROFILE_NAME }],
-    "appliedId": CLAUDE_DESKTOP_PROFILE_ID
   })
 }
 
@@ -1549,34 +1554,36 @@ fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<()
 
 fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
   let paths = claude_desktop_paths_in(home);
-  // Restore every backup taken at configure time.
+  // Restore every backup taken at configure time: the original content (and
+  // deployment mode) comes back exactly as it was.
+  let mut restored = Vec::new();
   for path in [
     &paths.normal_config,
     &paths.third_party_config,
     &paths.meta,
     &paths.profile,
   ] {
-    let backup = path.with_file_name(format!(
-      "{}.{}",
-      path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-      CLAUDE_DESKTOP_BACKUP
-    ));
+    let backup = backup_path_for(path);
     if backup.exists() {
       std::fs::copy(&backup, path)
         .map_err(|e| format!("Ripristino di {} non riuscito: {e}", path.display()))?;
       std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+      restored.push(path);
     }
   }
-  // No backup (e.g. the profile was created from scratch): strip our managed
-  // state so the app falls back to its default profile.
-  if !paths.profile.exists() && claude_desktop_our_profile(&paths.profile) {
+  // Fallbacks for files configure created from scratch (no backup existed):
+  // drop the managed profile when it is ours, and undo the 3p switch we made
+  // in configs that did not exist before.
+  if claude_desktop_our_profile(&paths.profile) {
     let _ = std::fs::remove_file(&paths.profile);
   }
-  if paths.normal_config.exists() {
-    set_deployment_mode(&paths.normal_config, "1p")?;
-  }
-  if paths.third_party_config.exists() {
-    set_deployment_mode(&paths.third_party_config, "1p")?;
+  for path in [&paths.normal_config, &paths.third_party_config] {
+    if !restored.contains(&&path) && path.exists() {
+      let cfg = read_json_allow_missing(path)?;
+      if cfg.get("deploymentMode") == Some(&serde_json::json!("3p")) {
+        set_deployment_mode(path, "1p")?;
+      }
+    }
   }
   if paths.meta.exists() {
     let mut meta = read_json_allow_missing(&paths.meta)?;
@@ -1684,12 +1691,12 @@ fn open_claude_desktop() -> Result<(), String> {
 // Claude persists its settings while shutting down: the profile must be
 // re-applied AFTER the process exits, otherwise its last write can restore
 // stale gateway values (same ordering as Ollama's launcher).
-fn restart_claude_desktop_with(model: &str, key: &str) -> Result<(), String> {
+fn restart_claude_desktop_with(reapply: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
   let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
   if claude_desktop_running() {
     quit_claude_desktop();
   }
-  configure_claude_desktop_in(&home, model, key)?;
+  reapply(&home)?;
   open_claude_desktop()
 }
 
@@ -1715,7 +1722,14 @@ pub async fn configure_claude_desktop(model: String, key: String) -> Result<AppR
 
 #[tauri::command]
 pub fn restart_claude_desktop(model: String, key: String) -> Result<(), String> {
-  restart_claude_desktop_with(model.trim(), key.trim())
+  restart_claude_desktop_with(|home| configure_claude_desktop_in(home, model.trim(), key.trim()))
+}
+
+// Restart after a restore: re-apply the restored state after the app exits so
+// the shutdown persistence cannot bring the Hive profile back.
+#[tauri::command]
+pub fn restart_claude_desktop_restored() -> Result<(), String> {
+  restart_claude_desktop_with(|home| restore_claude_desktop_in(home))
 }
 
 #[tauri::command]
@@ -3037,5 +3051,123 @@ mod tests {
     assert!(!is_newer_version("", "0.1.3"));
     assert!(!is_newer_version("0.1.3", ""));
     assert!(!is_newer_version("non-a-versione", "0.1.3"));
+  }
+
+  // Claude Desktop: configure writes the managed 3p profile and flips both
+  // configs to 3p; restore returns every file to its pre-Hive state.
+  fn claude_test_home() -> PathBuf {
+    let tmp = std::env::temp_dir().join(format!(
+      "requrv-launch-test-claude-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    let support = tmp.join("Library/Application Support");
+    std::fs::create_dir_all(support.join("Claude")).unwrap();
+    std::fs::create_dir_all(support.join("Claude-3p")).unwrap();
+    // Pre-existing user state that restore must bring back.
+    std::fs::write(
+      support.join("Claude/claude_desktop_config.json"),
+      r#"{"deploymentMode":"1p","custom":true}"#,
+    )
+    .unwrap();
+    std::fs::write(
+      support.join("Claude-3p/claude_desktop_config.json"),
+      r#"{"deploymentMode":"1p"}"#,
+    )
+    .unwrap();
+    tmp
+  }
+
+  #[test]
+  fn claude_desktop_configure_and_restore_roundtrip() {
+    let home = claude_test_home();
+    let paths = claude_desktop_paths_in(&home);
+
+    assert!(!claude_desktop_configured_in(&home));
+    configure_claude_desktop_in(&home, "requrv-small-3.8", "requrv_sk_test").unwrap();
+
+    // Both configs are in 3p mode and the managed profile is applied.
+    let normal = serde_json::from_str::<serde_json::Value>(
+      &std::fs::read_to_string(&paths.normal_config).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(normal["deploymentMode"], "3p");
+    // User keys survive the configure.
+    assert_eq!(normal["custom"], true);
+    let profile = serde_json::from_str::<serde_json::Value>(
+      &std::fs::read_to_string(&paths.profile).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(profile["inferenceProvider"], "gateway");
+    assert_eq!(profile["inferenceGatewayBaseUrl"], HIVE_CLAUDE_GATEWAY_BASE_URL);
+    assert_eq!(profile["inferenceGatewayApiKey"], "requrv_sk_test");
+    assert_eq!(profile["inferenceModels"][0]["name"], CLAUDE_DESKTOP_SLOT);
+    assert_eq!(
+      profile["inferenceModels"][0]["labelOverride"],
+      "requrv-small-3.8 (ReQurv)"
+    );
+    assert!(claude_desktop_configured_in(&home));
+
+    // Backups were taken for the pre-existing files.
+    assert!(paths.normal_config.with_file_name("claude_desktop_config.json.hive.bak").exists());
+
+    restore_claude_desktop_in(&home).unwrap();
+
+    // The original user config is back, the managed profile is gone, and the
+    // app is no longer flagged as configured.
+    let restored = serde_json::from_str::<serde_json::Value>(
+      &std::fs::read_to_string(&paths.normal_config).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored["deploymentMode"], "1p");
+    assert_eq!(restored["custom"], true);
+    assert!(!paths.profile.exists());
+    assert!(!claude_desktop_configured_in(&home));
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  // A profile created from scratch (no pre-existing file) is removed on
+  // restore rather than restored from a backup.
+  #[test]
+  fn claude_desktop_restore_removes_scratch_profile() {
+    let home = claude_test_home();
+    let paths = claude_desktop_paths_in(&home);
+    // Remove the 3p config so the profile/meta are created from nothing.
+    std::fs::remove_file(&paths.third_party_config).unwrap();
+    configure_claude_desktop_in(&home, "model-a", "requrv_sk_test").unwrap();
+    assert!(paths.profile.exists());
+    restore_claude_desktop_in(&home).unwrap();
+    assert!(!paths.profile.exists());
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  // PoC against the REAL home (not run by default):
+  //   cargo test claude_desktop_poc_real_home -- --ignored --nocapture
+  // Point Claude Desktop at the local proxy for the desktop app validation.
+  #[test]
+  #[ignore]
+  fn claude_desktop_poc_real_home() {
+    let home = home_dir().expect("home dir");
+    let key = std::env::var("POC_HIVE_KEY")
+      .unwrap_or_else(|_| "requrv_sk_localtest0000000000000000000000".to_string());
+    let model = std::env::var("POC_HIVE_MODEL").unwrap_or_else(|_| "requrv-small-3.8".to_string());
+    configure_claude_desktop_in(&home, &model, &key).unwrap();
+    let paths = claude_desktop_paths_in(&home);
+    println!("profile: {}", std::fs::read_to_string(&paths.profile).unwrap());
+    println!("meta:    {}", std::fs::read_to_string(&paths.meta).unwrap());
+    println!("configured: {}", claude_desktop_configured_in(&home));
+  }
+
+  // PoC restore against the REAL home (not run by default):
+  //   cargo test claude_desktop_poc_restore_real_home -- --ignored --nocapture
+  #[test]
+  #[ignore]
+  fn claude_desktop_poc_restore_real_home() {
+    let home = home_dir().expect("home dir");
+    restore_claude_desktop_in(&home).unwrap();
+    println!("configured after restore: {}", claude_desktop_configured_in(&home));
   }
 }
