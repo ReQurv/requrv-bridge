@@ -1,31 +1,47 @@
 @import 'tailwindcss';
 @import '@nuxt/ui';
 
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('https://requrv.io/wp-content/uploads/elementor/google-fonts/fonts/spacegrotesk-4ecc7e89.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Menda';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('https://requrv.io/wp-content/uploads/2025/04/Menda-Bold.ttf') format('truetype');
+}
+
 @theme static {
-  --font-sans: 'Public Sans', sans-serif;
-  --font-display: 'Manrope', sans-serif;
+  --font-sans: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Menda', 'Space Grotesk', sans-serif;
 
-  --color-primary-50: #fbf4ff;
-  --color-primary-100: #f6e7ff;
-  --color-primary-200: #eed2ff;
-  --color-primary-300: #e0b0ff;
-  --color-primary-400: #ce7dff;
-  --color-primary-500: #bb4bff;
-  --color-primary-600: #aa28f5;
-  --color-primary-700: #9418d8;
-  --color-primary-800: #7c19b0;
-  --color-primary-900: #66168d;
-  --color-primary-950: #33014c;
+  --color-primary-50: #fbf1fd;
+  --color-primary-100: #f5e3fa;
+  --color-primary-200: #eac7f4;
+  --color-primary-300: #d997ea;
+  --color-primary-400: #cb72e4;
+  --color-primary-500: #ae45d8;
+  --color-primary-600: #9c2bbf;
+  --color-primary-700: #7d1c9f;
+  --color-primary-800: #67177f;
+  --color-primary-900: #521365;
+  --color-primary-950: #340d40;
 
-  --color-secondary-50: #fff0fd;
-  --color-secondary-100: #ffe3fd;
-  --color-secondary-200: #ffc6fb;
-  --color-secondary-300: #ff98f5;
-  --color-secondary-400: #ff58eb;
-  --color-secondary-500: #ff27dc;
-  --color-secondary-600: #ff00c1;
-  --color-secondary-700: #df009d;
-  --color-secondary-800: #b80081;
-  --color-secondary-900: #98036e;
-  --color-secondary-950: #5f003f;
+  --color-secondary-50: #f0f0ff;
+  --color-secondary-100: #e1e0ff;
+  --color-secondary-200: #c3c1ff;
+  --color-secondary-300: #9892ff;
+  --color-secondary-400: #6c62ff;
+  --color-secondary-500: #1500ff;
+  --color-secondary-600: #1200d6;
+  --color-secondary-700: #1000b2;
+  --color-secondary-800: #0e008f;
+  --color-secondary-900: #0b006d;
+  --color-secondary-950: #06003d;
 }

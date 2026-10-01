@@ -28,7 +28,9 @@ ReQurv Launch is a desktop application that launches your AI coding agents pre-c
 - List the models available on AI Hive and pick a default one
 - Automatic detection of installed agents (with support for nvm, Volta, Homebrew, global npm installs and stale Windows registry PATH entries)
 - One-click launch:
-  - **Destination choice**: when both the desktop app and the CLI are installed, a dialog asks whether to open the app or the terminal; otherwise the launch goes directly to the available target
+  - **Target choice**: the app and CLI appear as separate actions, so you launch the installed surface directly
+  - **CLI installation**: when a CLI is not detected, its card shows the official platform-specific installer command and documentation. Run the copied command in your terminal, then return and click "Rileva"
+  - **CLI project folder**: the first CLI launch opens a folder picker; its selection is reused for the app session and can be changed with the "Cambia cartella" button in the project-folder panel. Every CLI launch uses that path as its working directory (Terminal on macOS; process working directory on Linux/Windows)
   - **OpenCode**: writes the `requrv-hive` provider into the global config file (`~/.config/opencode/opencode.jsonc` or `.json`), preserving other settings and creating a backup
   - **Codex (terminal)**: creates a dedicated profile (`~/.codex/hive.config.toml`) with `wire_api = "responses"` and launches the CLI with `--profile hive` and the `HIVE_API_KEY` variable
   - **ChatGPT.app (app, macOS only)**: points `~/.codex/config.toml` at AI Hive through a dedicated `requrv-hive` provider (`base_url`, `wire_api = "responses"`, key included; no WebSocket, which the gateway does not support) plus a model catalog in `~/.codex/hive-models.json`, and saves the key in `~/.codex/auth.json` in apikey mode; the original files are backed up as `.hive.bak` and can be restored with one click from the "Restore ChatGPT" button. The model catalog is read at startup, so if the app is already open a restart is requested

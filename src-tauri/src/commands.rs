@@ -228,6 +228,7 @@ pub struct ServiceStatus {
   pub codex_app_configured: bool,
   pub claude_code_cli: bool,
   pub hermes_app: bool,
+  pub hermes_cli: bool,
   pub claude_desktop: bool,
   pub claude_desktop_app: bool,
   pub claude_desktop_configured: bool,
@@ -244,8 +245,10 @@ pub fn check_services() -> ServiceStatus {
   let codex_app_configured = home_dir().is_some_and(|home| chatgpt_app_configured_in(&home));
   // Claude Code is terminal-only; Claude Desktop is app-only (3p gateway).
   let claude_code_cli = find_service_binary("claude").is_some();
-  // Hermes is a desktop app without a CLI, so only the app counts.
+  // Hermes Agent ships a desktop app and a standalone CLI; they are detected
+  // and launched independently.
   let hermes_app = hermes_app_path().is_some();
+  let hermes_cli = hermes_cli_path().is_some();
   let claude_desktop_app = claude_desktop_app_path().is_some();
   let claude_desktop_configured =
     home_dir().is_some_and(|home| claude_desktop_configured_in(&home));
@@ -261,6 +264,7 @@ pub fn check_services() -> ServiceStatus {
     codex_app_configured,
     claude_code_cli,
     hermes_app,
+    hermes_cli,
     claude_desktop: claude_desktop_app,
     claude_desktop_app,
     claude_desktop_configured,
@@ -643,7 +647,15 @@ fn codex_app_binary() -> Option<PathBuf> {
 }
 
 #[tauri::command]
-pub async fn launch_service(app: tauri::AppHandle, service: String, model: String, key: String, mode: String, models: Vec<HiveModel>) -> Result<(), String> {
+pub async fn launch_service(
+  app: tauri::AppHandle,
+  service: String,
+  model: String,
+  key: String,
+  mode: String,
+  project_directory: Option<String>,
+  models: Vec<HiveModel>,
+) -> Result<(), String> {
   let model = model.trim();
   let key = key.trim();
   if model.is_empty() {
@@ -655,17 +667,41 @@ pub async fn launch_service(app: tauri::AppHandle, service: String, model: Strin
   // ("codex", "app") is not handled here: the ChatGPT app flow needs a
   // restart confirmation, so the frontend drives it via configure_chatgpt_app,
   // open_chatgpt_app and restart_chatgpt_app. ("hermes", "app") is driven the
-  // same way via launch_hermes_app/restart_hermes_app (env vars live only in
-  // the launched process, so a running instance needs a confirmed restart).
-  // ("claude_code", "app") does not exist: Claude Desktop cannot be pointed at
-  // AI Hive (see the note in the Claude Desktop section).
+  // same way via launch_hermes_app/restart_hermes_app.
   match (service.as_str(), mode.as_str()) {
     ("opencode", "app") => launch_opencode_app(model, key),
-    ("opencode", "terminal") => launch_opencode_cli(&app, model, key),
-    ("codex", "terminal") => launch_codex_cli(&app, model, key, &models).await,
-    ("claude_code", "terminal") => launch_claude_cli(&app, model, key).await,
+    ("opencode", "terminal") => {
+      let directory = require_project_directory(project_directory.as_deref())?;
+      launch_opencode_cli(&app, model, key, &directory)
+    }
+    ("codex", "terminal") => {
+      let directory = require_project_directory(project_directory.as_deref())?;
+      launch_codex_cli(&app, model, key, &models, &directory).await
+    }
+    ("claude_code", "terminal") => {
+      let directory = require_project_directory(project_directory.as_deref())?;
+      launch_claude_cli(&app, model, key, &directory).await
+    }
+    ("hermes", "terminal") => {
+      let directory = require_project_directory(project_directory.as_deref())?;
+      launch_hermes_cli(&app, model, key, &directory).await
+    }
     _ => Err(format!("Avvio non valido: {service} in modalità {mode}")),
   }
+}
+
+fn require_project_directory(directory: Option<&str>) -> Result<PathBuf, String> {
+  let directory = directory
+    .map(str::trim)
+    .filter(|directory| !directory.is_empty())
+    .ok_or_else(|| String::from("Scegli una cartella di progetto prima di avviare la CLI."))?;
+  let path = Path::new(directory);
+  if !path.is_dir() {
+    return Err(String::from("La cartella di progetto selezionata non è più disponibile."));
+  }
+  path
+    .canonicalize()
+    .map_err(|_| String::from("Non è possibile accedere alla cartella di progetto selezionata."))
 }
 
 const OPENCODE_PROVIDER_ID: &str = "requrv-hive";
@@ -925,11 +961,16 @@ fn launch_opencode_app(_model: &str, _key: &str) -> Result<(), String> {
   Err(String::from("L'app OpenCode è disponibile solo su macOS."))
 }
 
-fn launch_opencode_cli(app: &tauri::AppHandle, model: &str, key: &str) -> Result<(), String> {
+fn launch_opencode_cli(
+  app: &tauri::AppHandle,
+  model: &str,
+  key: &str,
+  working_directory: &Path,
+) -> Result<(), String> {
   let bin = find_service_binary("opencode")
     .ok_or_else(|| String::from("OpenCode CLI non trovata. Installala da https://opencode.ai/download."))?;
   write_opencode_config(model, key)?;
-  launch_cli(app, "opencode", &bin, &[], &[])
+  launch_cli(app, "opencode", &bin, &[], &[], working_directory)
 }
 
 // Opens ChatGPT.app. The Hive settings (root config, model catalog, auth) are
@@ -1616,7 +1657,7 @@ fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
     let _ = std::fs::remove_file(&paths.profile);
   }
   for path in [&paths.normal_config, &paths.third_party_config] {
-    if !restored.contains(&&path) && path.exists() {
+    if !restored.contains(&path) && path.exists() {
       let cfg = read_json_allow_missing(path)?;
       if cfg.get("deploymentMode") == Some(&serde_json::json!("3p")) {
         set_deployment_mode(path, "1p")?;
@@ -1765,7 +1806,7 @@ pub fn restart_claude_desktop(model: String, key: String) -> Result<(), String> 
 // the shutdown persistence cannot bring the Hive profile back.
 #[tauri::command]
 pub fn restart_claude_desktop_restored() -> Result<(), String> {
-  restart_claude_desktop_with(|home| restore_claude_desktop_in(home))
+  restart_claude_desktop_with(restore_claude_desktop_in)
 }
 
 #[tauri::command]
@@ -1782,7 +1823,13 @@ pub fn open_claude_desktop_app() -> Result<(), String> {
   open_claude_desktop()
 }
 
-async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str, models: &[HiveModel]) -> Result<(), String> {
+async fn launch_codex_cli(
+  app: &tauri::AppHandle,
+  model: &str,
+  key: &str,
+  models: &[HiveModel],
+  working_directory: &Path,
+) -> Result<(), String> {
   let bin = find_service_binary("codex")
     .or_else(codex_app_binary)
     .ok_or_else(|| String::from("Codex non è installato. Scaricalo da https://chatgpt.com/codex."))?;
@@ -1816,7 +1863,7 @@ async fn launch_codex_cli(app: &tauri::AppHandle, model: &str, key: &str, models
 
   let args = vec!["--profile".to_string(), "hive".to_string()];
   let env: Vec<(&str, &str)> = vec![("HIVE_API_KEY", key)];
-  launch_cli(app, "codex", &bin, &args, &env)
+  launch_cli(app, "codex", &bin, &args, &env, working_directory)
 }
 
 // Claude Code speaks the Anthropic Messages API, so the launcher only sets
@@ -1844,7 +1891,12 @@ fn claude_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
   ]
 }
 
-async fn launch_claude_cli(app: &tauri::AppHandle, model: &str, key: &str) -> Result<(), String> {
+async fn launch_claude_cli(
+  app: &tauri::AppHandle,
+  model: &str,
+  key: &str,
+  working_directory: &Path,
+) -> Result<(), String> {
   let bin = find_service_binary("claude")
     .ok_or_else(|| String::from("Claude Code non è installato. Installalo con npm install -g @anthropic-ai/claude-code."))?;
 
@@ -1852,22 +1904,59 @@ async fn launch_claude_cli(app: &tauri::AppHandle, model: &str, key: &str) -> Re
 
   let hive_env = claude_hive_env(model, key);
   let env: Vec<(&str, &str)> = hive_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-  launch_cli(app, "claude", &bin, &[], &env)
+  launch_cli(app, "claude", &bin, &[], &env, working_directory)
+}
+
+// Launch the Hermes Agent CLI against AI Hive. Invocation and environment are
+// built apart from the spawn so the provider contract stays testable: the
+// built-in openai-api provider reads its endpoint from OPENAI_BASE_URL and its
+// key from OPENAI_API_KEY, so nothing is written to ~/.hermes, while
+// --provider and -m pin the provider and the model for this run only.
+fn hermes_cli_args(model: &str) -> Vec<String> {
+  vec![
+    "--provider".to_string(),
+    "openai-api".to_string(),
+    "-m".to_string(),
+    model.to_string(),
+  ]
+}
+
+fn hermes_cli_env(key: &str) -> Vec<(&'static str, String)> {
+  vec![
+    ("OPENAI_BASE_URL", hive_openai_base_url()),
+    ("OPENAI_API_KEY", key.to_string()),
+  ]
+}
+
+async fn launch_hermes_cli(
+  app: &tauri::AppHandle,
+  model: &str,
+  key: &str,
+  working_directory: &Path,
+) -> Result<(), String> {
+  let bin = hermes_cli_path()
+    .ok_or_else(|| format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."))?;
+
+  assert_endpoint_available(key, "/chat/completions", "Hermes").await?;
+
+  let env = hermes_cli_env(key);
+  let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+  launch_cli(app, "hermes", &bin, &hermes_cli_args(model), &env, working_directory)
 }
 
 // ---------------------------------------------------------------------------
-// Hermes IDE su AI Hive
+// Hermes Agent su AI Hive
 // ---------------------------------------------------------------------------
-// Hermes IDE is a desktop app without a CLI: its Agent mode runs the Claude
-// Agent SDK in a Node bridge that inherits the app process environment, so
-// the gateway is configured with ANTHROPIC_* env vars only (the same
-// contract as the Claude Code CLI: the gateway must expose POST /messages).
-// Nothing is persisted, so there is no restore: a fresh process carries the
-// configuration, while an already-running instance cannot receive env vars
-// and needs a restart (hence the frontend confirmation, like ChatGPT.app).
-// The initial agent-session spawn does not pass --model, so ANTHROPIC_MODEL
-// applies; a model switch from the Hermes UI takes precedence instead.
-const HERMES_DOWNLOAD_URL: &str = "https://hermes-ide.com/download";
+// Hermes Agent (hermes-agent.nousresearch.com) ships two surfaces: a desktop
+// app and a standalone CLI. Both are configured with environment variables
+// only, so nothing is persisted and there is no restore.
+//
+// The desktop app runs its own agent runtime and cannot receive env vars once
+// it is open, so a running instance needs a confirmed restart (like
+// ChatGPT.app). The CLI is pointed at AI Hive through the built-in openai-api
+// provider, which reads its endpoint from OPENAI_BASE_URL and its key from
+// OPENAI_API_KEY; the provider and model are pinned per invocation.
+const HERMES_DOWNLOAD_URL: &str = "https://hermes-agent.nousresearch.com/";
 
 // The macOS bundle is named HERMES-IDE.app; match any *.app whose name
 // contains "hermes" (case-insensitive) so renames and product-name changes
@@ -1929,11 +2018,40 @@ fn hermes_app_path() -> Option<PathBuf> {
   None
 }
 
-// True when any Hermes process is live. The process name follows the
-// bundle/binary executable, probed with the known packaging spellings.
+// The Hermes CLI launcher: `hermes` on PATH, or the wrapper install.sh writes
+// to ~/.local/bin on POSIX. Windows installs the checkout under
+// %HERMES_HOME%/%LOCALAPPDATA%[\hermes] and exposes hermes.exe in its venv.
+fn hermes_cli_path() -> Option<PathBuf> {
+  if let Some(bin) = find_on_path("hermes") {
+    return Some(bin);
+  }
+  if cfg!(windows) {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HERMES_HOME") {
+      roots.push(PathBuf::from(home));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+      roots.push(PathBuf::from(&local));
+      roots.push(PathBuf::from(local).join("hermes"));
+    }
+    for root in roots {
+      let candidate = root.join("hermes-agent").join("venv").join("Scripts").join("hermes.exe");
+      if candidate.is_file() {
+        return Some(candidate);
+      }
+    }
+    return None;
+  }
+  let fallback = home_dir()?.join(".local").join("bin").join("hermes");
+  fallback.is_file().then_some(fallback)
+}
+
+// True when any Hermes process is live. The macOS bundle ships the app as
+// "Hermes" (CFBundleExecutable), so the probe is case-sensitive on the exact
+// names; the lowercase spellings cover the older HERMES-IDE packaging.
 #[cfg(unix)]
 fn hermes_app_running() -> bool {
-  for name in ["HERMES-IDE", "hermes-ide", "hermes"] {
+  for name in ["Hermes", "HERMES-IDE", "hermes-ide"] {
     let running = Command::new("pgrep")
       .arg("-x")
       .arg(name)
@@ -1968,24 +2086,24 @@ fn hermes_app_running() -> bool {
   false
 }
 
-// The gateway configuration for Hermes: the same Anthropic contract the
-// Claude Code CLI uses, because the Agent mode runs the Claude Agent SDK.
+// The gateway configuration for the Hermes desktop app. Hermes resolves its
+// provider from the process environment, and the app cannot take a --provider
+// flag, so CUSTOM_BASE_URL redirects the configured custom provider while
+// OPENAI_BASE_URL makes OPENAI_API_KEY the key for that endpoint;
+// HERMES_INFERENCE_MODEL pins the model at process level.
+//
+// The CLI uses --provider openai-api instead (see hermes_cli_env): it is
+// explicit and independent of whatever provider the user configured. The app
+// has no equivalent, so these vars only take effect while ~/.hermes/config.yaml
+// resolves to the custom/openai-compatible path — a config on another provider
+// (e.g. nous) ignores them.
 fn hermes_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
+  let base = hive_openai_base_url();
   vec![
-    ("ANTHROPIC_BASE_URL", hive_anthropic_base_url()),
-    ("ANTHROPIC_API_KEY", key.to_string()),
-    ("ANTHROPIC_MODEL", model.to_string()),
-    // Pin every model tier and the subagent model like Claude Code: the
-    // Agent SDK otherwise falls back to internal claude-* defaults that the
-    // gateway does not know.
-    ("ANTHROPIC_DEFAULT_OPUS_MODEL", model.to_string()),
-    ("ANTHROPIC_DEFAULT_SONNET_MODEL", model.to_string()),
-    ("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()),
-    ("CLAUDE_CODE_SUBAGENT_MODEL", model.to_string()),
-    // The model is not in the client's catalog: pin its context window (real
-    // limit for the known model, conservative default otherwise) instead of
-    // letting auto-compact assume 200k.
-    ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", hive_model_context(model).to_string()),
+    ("CUSTOM_BASE_URL", base.clone()),
+    ("OPENAI_BASE_URL", base),
+    ("OPENAI_API_KEY", key.to_string()),
+    ("HERMES_INFERENCE_MODEL", model.to_string()),
   ]
 }
 
@@ -2135,7 +2253,7 @@ pub async fn launch_hermes_app(model: String, key: String) -> Result<AppRestartR
   if hermes_app_path().is_none() {
     return Err(format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."));
   }
-  assert_messages_available(key, "Hermes").await?;
+  assert_endpoint_available(key, "/chat/completions", "Hermes").await?;
   if hermes_app_running() {
     return Ok(AppRestartResult { restart_required: true });
   }
@@ -2171,8 +2289,16 @@ fn shell_quote(value: &str) -> String {
 // Build a bash script that sets the Hive env vars and runs the CLI so the
 // terminal window stays attached to the process (TUI apps need a real TTY).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn build_terminal_script(bin: &Path, args: &[String], env: &[(&str, &str)]) -> String {
-  let mut out = String::from("#!/bin/bash\ncd \"$HOME\"\n");
+fn build_terminal_script(
+  bin: &Path,
+  args: &[String],
+  env: &[(&str, &str)],
+  working_directory: &Path,
+) -> String {
+  let mut out = format!(
+    "#!/bin/bash\ncd -- {}\n",
+    shell_quote(&working_directory.to_string_lossy()),
+  );
   for (name, value) in env {
     out.push_str(&format!("export {name}={}\n", shell_quote(value)));
   }
@@ -2197,16 +2323,17 @@ fn launch_cli(
   bin: &Path,
   args: &[String],
   env: &[(&str, &str)],
+  working_directory: &Path,
 ) -> Result<(), String> {
   #[cfg(target_os = "macos")]
   {
-    let script = build_terminal_script(bin, args, env);
+    let script = build_terminal_script(bin, args, env, working_directory);
     open_terminal_script(app, service, &script)
   }
   #[cfg(not(target_os = "macos"))]
   {
     let _ = (app, service);
-    spawn_cli(bin, args, env)
+    spawn_cli(bin, args, env, working_directory)
   }
 }
 
@@ -2273,7 +2400,12 @@ fn is_powershell_shim(path: &Path) -> bool {
 // On macOS every launch goes through the terminal script; the detached spawn
 // is the fallback for Windows (new console) and Linux.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn spawn_cli(bin: &Path, args: &[String], env: &[(&str, &str)]) -> Result<(), String> {
+fn spawn_cli(
+  bin: &Path,
+  args: &[String],
+  env: &[(&str, &str)],
+  working_directory: &Path,
+) -> Result<(), String> {
   let mut command = Command::new(bin);
   #[cfg(windows)]
   if is_shell_shim(bin) {
@@ -2287,6 +2419,7 @@ fn spawn_cli(bin: &Path, args: &[String], env: &[(&str, &str)]) -> Result<(), St
       command.arg(bin);
     }
   }
+  command.current_dir(working_directory);
   command.args(args);
   command.stdin(Stdio::null());
   command.stdout(Stdio::null());
@@ -2436,6 +2569,17 @@ mod tests {
     assert_eq!(shell_quote("it's"), "'it'\\''s'");
     assert_eq!(shell_quote("a b c"), "'a b c'");
   }
+  #[test]
+  fn requires_an_existing_project_directory() {
+    let current = std::env::current_dir().unwrap();
+    assert_eq!(
+      require_project_directory(current.to_str()),
+      Ok(current.canonicalize().unwrap()),
+    );
+    assert!(require_project_directory(None).is_err());
+    assert!(require_project_directory(Some(" ")).is_err());
+    assert!(require_project_directory(std::env::current_exe().unwrap().to_str()).is_err());
+  }
 
   #[test]
   fn builds_opencode_terminal_script() {
@@ -2443,8 +2587,9 @@ mod tests {
       Path::new("/opt/homebrew/bin/opencode"),
       &[],
       &[("OPENCODE_CONFIG_CONTENT", "{\"model\":\"hive/x\"}")],
+      Path::new("/Users/x/Projects/it's fine"),
     );
-    assert!(script.starts_with("#!/bin/bash\ncd \"$HOME\"\n"));
+    assert!(script.starts_with("#!/bin/bash\ncd -- '/Users/x/Projects/it'\\''s fine'\n"));
     assert!(script.contains(r#"export OPENCODE_CONFIG_CONTENT='{"model":"hive/x"}'"#));
     assert!(script.contains("'/opt/homebrew/bin/opencode'"));
     assert!(script.ends_with("read -r _\n"));
@@ -2456,6 +2601,7 @@ mod tests {
       Path::new("/Users/x/.nvm/versions/node/v24/bin/codex"),
       &["--profile".to_string(), "hive".to_string()],
       &[("HIVE_API_KEY", "sk-test")],
+      Path::new("/Users/x/Projects/codex"),
     );
     assert!(script.contains("export HIVE_API_KEY='sk-test'"));
     assert!(script.contains("'--profile' 'hive'"));
@@ -2476,39 +2622,43 @@ mod tests {
         ("ANTHROPIC_MODEL", "model-a"),
         ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "128000"),
       ],
+      Path::new("/Users/x/Projects/claude"),
     );
     assert!(script.contains(&format!("export ANTHROPIC_BASE_URL='{anthropic_base}'")));
     assert!(script.contains("export ANTHROPIC_API_KEY='sk-test'"));
     assert!(script.contains("export ANTHROPIC_MODEL='model-a'"));
     assert!(script.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS='128000'"));
-    assert!(script.contains("'/Users/x/.local/bin/claude'"));
-    assert!(!script.contains("--"));
+    assert!(script.contains("'/Users/x/.local/bin/claude'\necho \"\""));
   }
 
-  // Hermes non ha config file: la configurazione vive solo nelle variabili
-  // d'ambiente del processo, con lo stesso contratto Anthropic del CLI.
+  // L'app desktop non accetta --provider: CUSTOM_BASE_URL redirige il provider
+  // configurato, OPENAI_BASE_URL rende OPENAI_API_KEY la chiave di quell'
+  // endpoint e HERMES_INFERENCE_MODEL pinna il modello. Niente file di
+  // configurazione, quindi niente restore.
   #[test]
-  fn builds_hermes_hive_env() {
+  fn builds_hermes_desktop_env() {
     let env = hermes_hive_env("model-a", "requrv_sk_test");
     let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("ANTHROPIC_BASE_URL"), Some(&hive_anthropic_base_url()));
-    assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"requrv_sk_test".to_string()));
-    assert_eq!(map.get("ANTHROPIC_MODEL"), Some(&"model-a".to_string()));
-    // Every tier and the subagent model are pinned to the selected model so
-    // the Agent SDK never falls back to internal claude-* defaults.
-    assert_eq!(map.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some(&"model-a".to_string()));
-    assert_eq!(map.get("ANTHROPIC_DEFAULT_SONNET_MODEL"), Some(&"model-a".to_string()));
-    assert_eq!(map.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"), Some(&"model-a".to_string()));
-    assert_eq!(map.get("CLAUDE_CODE_SUBAGENT_MODEL"), Some(&"model-a".to_string()));
-    assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"128000".to_string()));
-    assert_eq!(map.len(), 8);
+    assert_eq!(map.get("CUSTOM_BASE_URL"), Some(&hive_openai_base_url()));
+    assert_eq!(map.get("OPENAI_BASE_URL"), Some(&hive_openai_base_url()));
+    assert_eq!(map.get("OPENAI_API_KEY"), Some(&"requrv_sk_test".to_string()));
+    assert_eq!(map.get("HERMES_INFERENCE_MODEL"), Some(&"model-a".to_string()));
+    assert_eq!(map.len(), 4);
   }
 
+  // The Hermes CLI is pointed at AI Hive through the built-in openai-api
+  // provider: endpoint and key travel in the environment (nothing is written
+  // to ~/.hermes) and the provider/model are pinned per invocation.
   #[test]
-  fn hermes_env_uses_real_context_for_known_model() {
-    let env = hermes_hive_env("requrv-small-3.8", "requrv_sk_test");
+  fn builds_hermes_cli_invocation() {
+    let args = hermes_cli_args("requrv-small-3.8");
+    assert_eq!(args.join(" "), "--provider openai-api -m requrv-small-3.8");
+
+    let env = hermes_cli_env("requrv_sk_test");
     let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"), Some(&"262144".to_string()));
+    assert_eq!(map.get("OPENAI_BASE_URL"), Some(&hive_openai_base_url()));
+    assert_eq!(map.get("OPENAI_API_KEY"), Some(&"requrv_sk_test".to_string()));
+    assert_eq!(map.len(), 2);
   }
 
   #[test]

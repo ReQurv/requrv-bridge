@@ -17,7 +17,8 @@
     "@iconify-json/lucide": "^1.2.129",
     "@iconify-json/simple-icons": "^1.2.94",
     "@nuxt/ui": "^4.11.0",
-    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/plugin-dialog": "^2.8.1",
     "@tauri-apps/plugin-opener": "^2.5.5",
     "nuxt": "^4.5.2",
     "tailwindcss": "^4.3.3"

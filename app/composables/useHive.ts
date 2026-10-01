@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl } from '@tauri-apps/plugin-opener'
 
 export type ServiceId = 'opencode' | 'codex' | 'claude_code' | 'hermes' | 'claude_desktop'
@@ -16,6 +17,7 @@ export interface ServiceStatus {
   codex_app_configured: boolean
   claude_code_cli: boolean
   hermes_app: boolean
+  hermes_cli: boolean
   claude_desktop: boolean
   claude_desktop_app: boolean
   claude_desktop_configured: boolean
@@ -37,51 +39,172 @@ export interface HiveModel {
   model_type: string
 }
 
-export const SERVICE_META: Record<
-  ServiceId,
-  {
-    title: string
-    description: string
-    icon: string
+export type SurfaceKind = 'desktop' | 'cli'
+
+// One launchable surface of a vendor: a concrete app or CLI. `service` is the
+// backend service id, `kind` selects the launch mode (desktop -> app,
+// cli -> terminal).
+export type ServiceSurface
+  = {
+    service: ServiceId
+    kind: 'desktop'
+    name: string
     downloadUrl: string
   }
-> = {
-  opencode: {
-    title: 'OpenCode',
-    description: 'IDE di coding di OpenCode. Scarica e installa l\'app, poi riprova.',
-    icon: 'i-simple-icons-opencode',
-    downloadUrl: 'https://opencode.ai/download'
-  },
-  codex: {
-    title: 'Codex',
-    description: 'CLI di coding di OpenAI. Usa un profilo dedicato puntato ad AI Hive.',
-    icon: 'i-simple-icons-openai',
-    downloadUrl: 'https://chatgpt.com/codex'
-  },
-  claude_code: {
-    title: 'Claude Code',
-    description: 'CLI di coding di Anthropic. Si avvia nel terminale puntato ad AI Hive (npm install -g @anthropic-ai/claude-code).',
-    icon: 'i-simple-icons-claudecode',
-    downloadUrl: 'https://claude.com/product/claude-code'
-  },
-  hermes: {
-    title: 'Hermes',
-    description: 'IDE di coding con Agent su AI Hive: la configurazione passa come variabili d\'ambiente del processo, senza file di configurazione.',
-    icon: 'i-simple-icons-hermes',
-    downloadUrl: 'https://hermes-ide.com/download'
-  },
-  claude_desktop: {
-    title: 'Claude Desktop',
-    description: 'App desktop di Claude: profilo 3p puntato al gateway AI Hive, con il modello Hive nel picker al posto di Sonnet/Opus.',
-    icon: 'i-simple-icons-claude',
-    downloadUrl: 'https://claude.com/download'
+  | {
+    service: ServiceId
+    kind: 'cli'
+    name: string
+    installCommand: string
+    windowsInstallCommand?: string
+    installDocsUrl: string
   }
+
+// A vendor and the surfaces it exposes. Every vendor offers a Desktop and a CLI
+// entry so the rows read the same way, whichever agent they belong to.
+export interface ServiceGroup {
+  id: string
+  title: string
+  icon: string
+  // Optional in-repo component for vendors with no Simple Icons glyph.
+  logo?: string
+  description: string
+  surfaces: ServiceSurface[]
 }
 
-// Desktop app label shown in toasts and restart dialogs.
-const APP_LABELS: Partial<Record<ServiceId, string>> = {
+export const SERVICE_GROUPS: ServiceGroup[] = [
+  {
+    id: 'claude',
+    title: 'Claude',
+    icon: 'i-simple-icons-claude',
+    description: 'App desktop e CLI di Anthropic.',
+    surfaces: [
+      {
+        service: 'claude_desktop',
+        kind: 'desktop',
+        name: 'Claude Desktop',
+        downloadUrl: 'https://claude.com/download'
+      },
+      {
+        service: 'claude_code',
+        kind: 'cli',
+        name: 'Claude Code',
+        installCommand: 'curl -fsSL https://claude.ai/install.sh | bash',
+        windowsInstallCommand: 'irm https://claude.ai/install.ps1 | iex',
+        installDocsUrl: 'https://code.claude.com/docs/en/setup'
+      }
+    ]
+  },
+  {
+    id: 'opencode',
+    title: 'OpenCode',
+    icon: 'i-simple-icons-opencode',
+    description: 'App e CLI di OpenCode.',
+    surfaces: [
+      {
+        service: 'opencode',
+        kind: 'desktop',
+        name: 'OpenCode app',
+        downloadUrl: 'https://opencode.ai/download'
+      },
+      {
+        service: 'opencode',
+        kind: 'cli',
+        name: 'OpenCode CLI',
+        installCommand: 'curl -fsSL https://opencode.ai/install | bash',
+        windowsInstallCommand: 'npm install -g opencode-ai',
+        installDocsUrl: 'https://opencode.ai/docs/'
+      }
+    ]
+  },
+  {
+    id: 'chatgpt',
+    title: 'ChatGPT',
+    icon: 'i-simple-icons-openai',
+    description: 'ChatGPT.app e la CLI Codex di OpenAI.',
+    surfaces: [
+      {
+        service: 'codex',
+        kind: 'desktop',
+        name: 'ChatGPT app',
+        downloadUrl: 'https://openai.com/chatgpt/download/'
+      },
+      {
+        service: 'codex',
+        kind: 'cli',
+        name: 'Codex CLI',
+        installCommand: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh',
+        windowsInstallCommand: 'powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"',
+        installDocsUrl: 'https://learn.chatgpt.com/docs/codex/cli'
+      }
+    ]
+  },
+  {
+    id: 'hermes',
+    title: 'Hermes',
+    icon: 'i-simple-icons-hermes',
+    logo: 'HermesLogo',
+    description: 'Hermes Agent di Nous Research.',
+    surfaces: [
+      {
+        service: 'hermes',
+        kind: 'desktop',
+        name: 'Hermes Desktop',
+        downloadUrl: 'https://hermes-agent.nousresearch.com/'
+      },
+      {
+        service: 'hermes',
+        kind: 'cli',
+        name: 'Hermes CLI',
+        installCommand: 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash',
+        windowsInstallCommand: 'iex (irm https://hermes-agent.nousresearch.com/install.ps1)',
+        installDocsUrl: 'https://hermes-agent.nousresearch.com/docs/getting-started/installation'
+      }
+    ]
+  }
+]
+
+// Bare vendor name, used where no surface is implied (restart dialogs, errors).
+const SERVICE_LABELS: Record<ServiceId, string> = {
+  opencode: 'OpenCode',
   codex: 'ChatGPT',
+  claude_code: 'Claude Code',
+  hermes: 'Hermes',
   claude_desktop: 'Claude'
+}
+
+const ALL_SURFACES = SERVICE_GROUPS.flatMap(group => group.surfaces)
+
+export function surfaceKey(surface: ServiceSurface): string {
+  return `${surface.service}:${surface.kind}`
+}
+
+// Concrete surface name for toasts ("OpenCode CLI avviato").
+function surfaceLabel(service: ServiceId, mode: LaunchMode): string {
+  const kind: SurfaceKind = mode === 'app' ? 'desktop' : 'cli'
+  const surface = ALL_SURFACES.find(s => s.service === service && s.kind === kind)
+  return surface?.name ?? SERVICE_LABELS[service]
+}
+
+// Installed/configured state of one surface, read from the backend status.
+export function surfaceState(st: ServiceStatus | null, surface: ServiceSurface): { installed: boolean, configured: boolean } {
+  if (!st) return { installed: false, configured: false }
+  if (surface.service === 'claude_desktop') {
+    return { installed: st.claude_desktop_app, configured: st.claude_desktop_configured }
+  }
+  if (surface.service === 'claude_code') {
+    return { installed: st.claude_code_cli, configured: false }
+  }
+  if (surface.service === 'hermes') {
+    return { installed: surface.kind === 'desktop' ? st.hermes_app : st.hermes_cli, configured: false }
+  }
+  if (surface.service === 'opencode') {
+    return { installed: surface.kind === 'desktop' ? st.opencode_app : st.opencode_cli, configured: false }
+  }
+  return {
+    installed: surface.kind === 'desktop' ? st.codex_app : st.codex_cli,
+    configured: surface.kind === 'desktop' && st.codex_app_configured
+  }
 }
 
 const isTauri = computed(() => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window)
@@ -101,10 +224,10 @@ const chatModels = computed(() => {
 const chatModelIds = computed(() => chatModels.value.map(m => m.id))
 const status = ref<ServiceStatus | null>(null)
 const refreshing = ref(false)
-const launching = ref<ServiceId | null>(null)
+// Surface key (`<service>:<kind>`) of the tile currently launching: two tiles
+// of the same vendor (app and CLI) must not share a busy state.
+const launching = ref<string | null>(null)
 const keyModalOpen = ref(false)
-const launchTarget = ref<ServiceId | null>(null)
-const launchModalOpen = ref(false)
 const restartModalOpen = ref(false)
 const restartTarget = ref<ServiceId | null>(null)
 // The restart re-applies either the Hive profile (configure flow) or the
@@ -115,6 +238,7 @@ const restoring = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
 const checkingForUpdate = ref(false)
 const updateDismissed = ref(false)
+const projectDirectory = ref('')
 
 export function useHive() {
   const toast = useToast()
@@ -226,29 +350,40 @@ export function useHive() {
     selectedModel.value = ''
   }
 
-  // La destinazione (app o terminale) è scelta dall'utente: se entrambe sono
-  // disponibili si apre il modale, altrimenti si avvia quella esistente.
-  async function requestLaunch(service: ServiceId) {
-    if (!key.value.trim() || !selectedModel.value || launching.value) return
-    await refreshStatus()
-    // Claude Code is terminal-only. Hermes and Claude Desktop are app-only:
-    // they have no CLI, so there is nothing to launch in a terminal.
-    const appAvailable = service === 'claude_code' ? false : status.value?.[`${service}_app`] ?? false
-    const terminalAvailable = service === 'hermes' || service === 'claude_desktop' ? false : status.value?.[`${service}_cli`] ?? false
-    if (appAvailable && terminalAvailable) {
-      launchTarget.value = service
-      launchModalOpen.value = true
-    } else if (terminalAvailable) {
-      await launch(service, 'terminal')
-    } else if (appAvailable) {
-      await launch(service, 'app')
+  // The selected directory is shared by CLI launchers for this app session.
+  async function chooseProjectDirectory(): Promise<string | null> {
+    if (!isTauri.value) return null
+    try {
+      const selected = await open({
+        title: 'Scegli cartella di progetto',
+        directory: true,
+        multiple: false,
+        ...(projectDirectory.value ? { defaultPath: projectDirectory.value } : {})
+      })
+      if (typeof selected === 'string') projectDirectory.value = selected
+      return typeof selected === 'string' ? selected : null
+    } catch (error) {
+      toast.add({
+        title: 'Selezione cartella non riuscita',
+        description: String(error),
+        color: 'error'
+      })
+      return null
     }
   }
+  // The surface is already selected in the card; configure and launch only that target.
 
-  async function launch(service: ServiceId, mode: LaunchMode) {
+  async function launch(surface: ServiceSurface) {
+    const { service } = surface
+    const mode: LaunchMode = surface.kind === 'desktop' ? 'app' : 'terminal'
     if (!key.value.trim() || !selectedModel.value || launching.value) return
-    launching.value = service
+    launching.value = surfaceKey(surface)
+
     try {
+      const workingDirectory = surface.kind === 'cli'
+        ? projectDirectory.value || await chooseProjectDirectory()
+        : null
+      if (surface.kind === 'cli' && !workingDirectory) return
       if (service === 'codex' && mode === 'app') {
         // Il flusso app configura ChatGPT su AI Hive e, se l'app è già aperta,
         // chiede di riavviarla perché il catalogo modelli si legge all'avvio.
@@ -270,10 +405,10 @@ export function useHive() {
         await refreshStatus()
         return
       }
-      if (service === 'hermes') {
-        // Hermes non ha file di configurazione: la configurazione viaggia solo
-        // nelle variabili d'ambiente del processo appena avviato. Un'istanza
-        // già aperta non può riceverle, quindi si chiede il riavvio.
+      if (service === 'hermes' && mode === 'app') {
+        // Anche l'app desktop si configura con sole variabili d'ambiente, ma
+        // un'istanza già aperta non può riceverle: serve il riavvio. (La CLI
+        // parte come processo nuovo, quindi passa dal ramo generico.)
         const result = await invoke<AppRestartResult>('launch_hermes_app', {
           model: selectedModel.value,
           key: key.value.trim()
@@ -316,17 +451,18 @@ export function useHive() {
         model: selectedModel.value,
         key: key.value.trim(),
         mode,
+        projectDirectory: workingDirectory,
         models: chatModels.value
       })
       toast.add({
-        title: `${SERVICE_META[service].title} avviato`,
+        title: `${surfaceLabel(service, mode)} avviato`,
 
         color: 'success'
       })
       await refreshStatus()
     } catch (error) {
       toast.add({
-        title: `Avvio di ${SERVICE_META[service].title} non riuscito`,
+        title: `Avvio di ${surfaceLabel(service, mode)} non riuscito`,
         description: String(error),
         color: 'error'
       })
@@ -339,7 +475,7 @@ export function useHive() {
     const service = restartTarget.value
     restartModalOpen.value = false
     if (!service || (service !== 'codex' && service !== 'hermes' && service !== 'claude_desktop')) return
-    const label = APP_LABELS[service] ?? SERVICE_META[service].title
+    const label = SERVICE_LABELS[service]
     restarting.value = true
     try {
       if (service === 'codex') {
@@ -379,7 +515,7 @@ export function useHive() {
     const service = restartTarget.value
     restartModalOpen.value = false
     if (!service) return
-    const label = APP_LABELS[service] ?? SERVICE_META[service].title
+    const label = SERVICE_LABELS[service]
     toast.add({
       title: `${label} si aggiornerà al prossimo avvio`,
       color: 'info'
@@ -390,7 +526,7 @@ export function useHive() {
     if (service !== 'codex' && service !== 'claude_desktop') return
     if (!isTauri.value || restoring.value) return
     restoring.value = true
-    const label = APP_LABELS[service] ?? SERVICE_META[service].title
+    const label = SERVICE_LABELS[service]
     try {
       const result = await invoke<AppRestartResult>(
         service === 'codex' ? 'restore_chatgpt_app' : 'restore_claude_desktop'
@@ -427,6 +563,7 @@ export function useHive() {
 
   return {
     isTauri,
+    projectDirectory,
     key,
     keySaved,
     saving,
@@ -436,8 +573,6 @@ export function useHive() {
     refreshing,
     launching,
     keyModalOpen,
-    launchTarget,
-    launchModalOpen,
     restartModalOpen,
     restartTarget,
     restarting,
@@ -452,11 +587,11 @@ export function useHive() {
     loadSavedKey,
     saveKey,
     clearKey,
-    requestLaunch,
     launch,
     confirmRestart,
     cancelRestart,
     restoreApp,
-    openExternal
+    openExternal,
+    chooseProjectDirectory
   }
 }
