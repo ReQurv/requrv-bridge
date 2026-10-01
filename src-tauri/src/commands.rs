@@ -1761,10 +1761,16 @@ fn quit_claude_desktop() {
 #[cfg(not(target_os = "macos"))]
 fn quit_claude_desktop() {}
 
+#[cfg(target_os = "macos")]
 fn open_claude_desktop() -> Result<(), String> {
   let bundle = claude_desktop_app_path()
     .ok_or_else(|| String::from("Claude.app non trovato: installalo da https://claude.com/download."))?;
   open_app_bundle(&bundle, "Claude.app")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_claude_desktop() -> Result<(), String> {
+  Err(String::from("Claude Desktop è disponibile solo su macOS."))
 }
 
 // Claude persists its settings while shutting down: the profile must be
