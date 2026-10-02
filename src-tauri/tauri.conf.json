@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "ReQurv Launch",
+  "productName": "ReQurv Bridge",
   "version": "0.2.2",
   "identifier": "ai.requrv.launch",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "ReQurv Launch",
+        "title": "ReQurv Bridge",
         "width": 1024,
         "height": 720,
         "resizable": true,

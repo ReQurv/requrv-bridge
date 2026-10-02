@@ -1,17 +1,17 @@
-# ReQurv Launch
+# ReQurv Bridge
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-00DC82?logo=gnu)](./LICENSE)
 [![CI](https://img.shields.io/badge/CI-lint%20%2B%20typecheck%20%2B%20tests-00DC82?logo=githubactions)](https://github.com/ReQurv/requrv-launch/actions)
 [![Release](https://img.shields.io/github/v/release/ReQurv/requrv-launch?label=release)](https://github.com/ReQurv/requrv-launch/releases)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555)](https://github.com/ReQurv/requrv-launch/releases)
 
-![ReQurv](public/logo_requrv.svg)
+![ReQurv Bridge](public/logo_requrv_bridge.png)
 
-ReQurv Launch is a desktop application that launches your AI coding agents pre-configured for [AI Hive](https://hive.requrv.ai), the ReQurv AI gateway.
+ReQurv Bridge is a desktop application that launches your AI coding agents pre-configured for [AI Hive](https://hive.requrv.ai), the ReQurv AI gateway.
 
-[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download%20for%20macOS%20(Apple%20Silicon)-dmg-00DC82?logo=apple&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Launch_aarch64.dmg)
-[![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-msi%20%C2%B7%20exe-00DC82?logo=windows&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Launch_x64-setup.exe)
-[![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-AppImage%20%C2%B7%20deb%20%C2%B7%20rpm-00DC82?logo=linux&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Launch_amd64.AppImage)
+[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download%20for%20macOS%20(Apple%20Silicon)-dmg-00DC82?logo=apple&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Bridge_aarch64.dmg)
+[![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-msi%20%C2%B7%20exe-00DC82?logo=windows&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Bridge_x64-setup.exe)
+[![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-AppImage%20%C2%B7%20deb%20%C2%B7%20rpm-00DC82?logo=linux&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Bridge_amd64.AppImage)
 
 ![Screenshot](docs/screenshot.png)
 
@@ -55,7 +55,7 @@ You need an AI Hive API key, which you paste into the app once (it is validated 
 
 - **macOS**: release builds are code-signed (Developer ID) and notarized, so the app opens without any Gatekeeper warning
 - **Windows**: the build is not code-signed. When SmartScreen shows "Windows protected your PC", click **More info** → **Run anyway**
-- **Linux**: unsigned packages. If the AppImage won't start, grant it execute permission with `chmod +x ReQurv-Launch_*.AppImage`
+- **Linux**: unsigned packages. If the AppImage won't start, grant it execute permission with `chmod +x ReQurv-Bridge_*.AppImage`
 
 ## Development
 

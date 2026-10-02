@@ -2496,7 +2496,7 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateInfo, Stri
   // intestazione la verifica fallisce sempre e il banner non compare.
   let response = client
     .get(GITHUB_LATEST_RELEASE_URL)
-    .header(reqwest::header::USER_AGENT, format!("ReQurv Launch/{current_version}"))
+    .header(reqwest::header::USER_AGENT, format!("ReQurv Bridge/{current_version}"))
     .timeout(std::time::Duration::from_secs(10))
     .send()
     .await

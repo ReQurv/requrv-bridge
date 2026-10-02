@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        ReQurv Launch exists so the community can connect more agents to AI Hive. Please fill in what you know — maintainers will help with the rest.
+        ReQurv Bridge exists so the community can connect more agents to AI Hive. Please fill in what you know — maintainers will help with the rest.
   - type: input
     id: agent
     attributes:

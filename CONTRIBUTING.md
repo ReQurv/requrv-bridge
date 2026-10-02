@@ -1,6 +1,6 @@
-# Contributing to ReQurv Launch
+# Contributing to ReQurv Bridge
 
-Thanks for your interest in ReQurv Launch! The app is a thin, open-source layer between you and [AI Hive](https://hive.requrv.ai): its only job is to detect the AI coding agents installed on your machine and launch them pre-configured for the Hive gateway.
+Thanks for your interest in ReQurv Bridge! The app is a thin, open-source layer between you and [AI Hive](https://hive.requrv.ai): its only job is to detect the AI coding agents installed on your machine and launch them pre-configured for the Hive gateway.
 
 The best contributions are **new connectors**: support for another agent, IDE or CLI that can be pointed at AI Hive (e.g. Aider, Gemini CLI, Goose, Cline...). This document explains the architecture and walks you through adding one end-to-end.
 

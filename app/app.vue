@@ -14,7 +14,7 @@ useHead({
   }
 })
 
-const title = 'ReQurv Launch'
+const title = 'ReQurv Bridge'
 const description = 'Lancia i tuoi agenti AI già configurati per AI Hive, l\'AI Gateway di ReQurv.'
 
 useSeoMeta({
@@ -51,19 +51,21 @@ onMounted(async () => {
             <NuxtLink
               to="/"
               class="focus-visible:outline-3 outline-primary/25 rounded-md p-1 -ms-1"
+              aria-label="ReQurv Bridge"
             >
-              <AppLogo class="w-auto h-8 sm:h-10 shrink-0" />
+              <!-- Logo trasparente: in light mode il chip nero mantiene la leggibilità del testo bianco -->
+              <img
+                src="/logo_requrv_bridge.png"
+                alt="ReQurv Bridge"
+                class="w-auto h-8 rounded-md bg-black sm:h-10 dark:bg-transparent"
+              >
             </NuxtLink>
 
             <div class="min-w-0">
-              <p class="whitespace-nowrap text-sm font-semibold leading-tight">
-                ReQurv Launch
-              </p>
               <p class="hidden truncate text-xs leading-tight text-muted md:block">
                 Lancia i tuoi agenti AI già configurati per AI Hive, l'AI Gateway di ReQurv.
               </p>
             </div>
-
             <UButton
               label="AI Hive"
               icon="i-lucide-external-link"
@@ -110,7 +112,7 @@ onMounted(async () => {
           icon="i-lucide-arrow-up-circle"
           orientation="horizontal"
           title="Nuova versione disponibile"
-          :description="`Scarica e avvia l'ultima release (v${updateInfo.latest_version}) per aggiornare ReQurv Launch.`"
+          :description="`Scarica e avvia l'ultima release (v${updateInfo.latest_version}) per aggiornare ReQurv Bridge.`"
           :actions="[
             {
               label: 'Scarica',
@@ -141,7 +143,7 @@ onMounted(async () => {
       >
         <template #left>
           <p class="truncate text-xs text-muted sm:text-sm">
-            ReQurv Launch © {{ new Date().getFullYear() }} — powered by
+            ReQurv Bridge © {{ new Date().getFullYear() }} — powered by
             <button
               type="button"
               class="cursor-pointer text-primary hover:underline"
