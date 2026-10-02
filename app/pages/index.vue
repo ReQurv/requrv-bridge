@@ -40,7 +40,7 @@ const availableSurfaces = computed(() =>
             color="success"
             variant="subtle"
             icon="i-lucide-check-circle-2"
-            :label="`${availableSurfaces} ${availableSurfaces === 1 ? 'superficie disponibile' : 'superfici disponibili'}`"
+            :label="`${availableSurfaces} ${availableSurfaces === 1 ? 'app disponibile' : 'app disponibili'}`"
           />
           <UButton
             icon="i-lucide-refresh-cw"
