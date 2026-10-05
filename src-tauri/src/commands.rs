@@ -1127,17 +1127,31 @@ fn write_opencode_config(model: &str, key: &str) -> Result<(), String> {
   write_opencode_config_in(&home, model, key).map(|_| ())
 }
 
-// Opens a desktop .app bundle via LaunchServices.
+// Opens a desktop .app bundle via LaunchServices. `open` forwards the caller's
+// environment to the app, so `env` pins the variables the app must see.
 #[cfg(target_os = "macos")]
-fn open_app_bundle(bundle: &Path, label: &str) -> Result<(), String> {
-  Command::new("open")
-    .arg(bundle)
+fn open_app_bundle(bundle: &Path, label: &str, env: &[(&str, &str)]) -> Result<(), String> {
+  let mut command = Command::new("open");
+  command.arg(bundle);
+  for (name, value) in env {
+    command.env(name, value);
+  }
+  command
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .spawn()
     .map(|_| ())
     .map_err(|e| format!("Impossibile avviare {label}: {e}"))
+}
+
+// The codex home this launcher writes and reads. Pinned explicitly whenever a
+// codex surface is launched, because `open` and the spawned shells forward the
+// caller's environment: a CODEX_HOME inherited from the shell that started the
+// bridge (e.g. an editor-managed codex runtime) would otherwise send codex to
+// a different config than the one written here.
+fn hive_codex_home() -> Option<PathBuf> {
+  home_dir().map(|home| codex_dir_in(&home))
 }
 
 // True when the OpenCode desktop app is live. `pgrep -x` is case-sensitive and
@@ -1192,7 +1206,7 @@ pub fn configure_opencode_app(_model: String, _key: String) -> Result<AppRestart
 pub fn open_opencode_app() -> Result<(), String> {
   let bundle = opencode_app_path()
     .ok_or_else(|| String::from("OpenCode.app non trovato in /Applications: installalo e riprova."))?;
-  open_app_bundle(&bundle, "OpenCode.app")
+  open_app_bundle(&bundle, "OpenCode.app", &[])
 }
 
 #[tauri::command]
@@ -1222,7 +1236,7 @@ fn quit_and_reopen_opencode() -> Result<(), String> {
       std::thread::sleep(std::time::Duration::from_millis(500));
     }
   }
-  open_app_bundle(&bundle, "OpenCode.app")
+  open_app_bundle(&bundle, "OpenCode.app", &[])
 }
 
 #[tauri::command]
@@ -1256,7 +1270,9 @@ fn launch_opencode_cli(
 pub fn open_chatgpt_app() -> Result<(), String> {
   let bundle = chatgpt_app_bundle()
     .ok_or_else(|| String::from("ChatGPT.app non trovato in /Applications: installalo e riprova."))?;
-  open_app_bundle(&bundle, "ChatGPT.app")
+  let codex_home = hive_codex_home().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let codex_home = codex_home.to_string_lossy();
+  open_app_bundle(&bundle, "ChatGPT.app", &[("CODEX_HOME", codex_home.as_ref())])
 }
 
 #[tauri::command]
@@ -1507,10 +1523,10 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
   provider.insert("wire_api".into(), toml::Value::String("responses".into()));
   provider.insert("supports_websockets".into(), toml::Value::Boolean(false));
   provider.insert("experimental_bearer_token".into(), toml::Value::String(key.to_string()));
-  // ChatGPT.app authenticates with the bearer token above, the CLI reads the
-  // key from the environment variable the launcher exports: both surfaces
-  // share this one provider table.
-  provider.insert("env_key".into(), toml::Value::String("HIVE_API_KEY".into()));
+  // No `env_key`: codex refuses to start with "Missing environment variable"
+  // when the provider declares one and the variable is absent (a CLI typed by
+  // hand, or the app), and the bearer token above already authenticates both
+  // surfaces.
   let providers = table
     .entry("model_providers")
     .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -1699,7 +1715,9 @@ fn quit_and_reopen_chatgpt() -> Result<(), String> {
       }
     }
   }
-  open_app_bundle(&bundle, "ChatGPT.app")
+  let codex_home = hive_codex_home().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let codex_home = codex_home.to_string_lossy();
+  open_app_bundle(&bundle, "ChatGPT.app", &[("CODEX_HOME", codex_home.as_ref())])
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2048,7 +2066,7 @@ fn quit_claude_desktop() {}
 fn open_claude_desktop() -> Result<(), String> {
   let bundle = claude_desktop_app_path()
     .ok_or_else(|| String::from("Claude.app non trovato: installalo da https://claude.com/download."))?;
-  open_app_bundle(&bundle, "Claude.app")
+  open_app_bundle(&bundle, "Claude.app", &[])
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2137,8 +2155,13 @@ async fn launch_codex_cli(
   let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
   configure_chatgpt_app_in(&home, model, models, key)?;
 
-  let env: Vec<(&str, &str)> = vec![("HIVE_API_KEY", key)];
-  launch_cli(app, "codex", &bin, &[], &env, working_directory)
+  // CODEX_HOME is pinned: the shell may carry one from another tool (an
+  // editor-managed codex runtime), and codex would then read a config this
+  // launcher never wrote. The provider itself authenticates with the bearer
+  // token in config.toml, so no key env is needed.
+  let codex_home = codex_dir_in(&home);
+  let codex_home = codex_home.to_string_lossy();
+  launch_cli(app, "codex", &bin, &[], &[("CODEX_HOME", codex_home.as_ref())], working_directory)
 }
 
 // Claude Code speaks the Anthropic Messages API, so the launcher only sets
@@ -3148,17 +3171,20 @@ mod tests {
     assert!(script.ends_with("read -r _\n"));
   }
 
+  // La CLI codex non riceve argomenti; CODEX_HOME è pinnato (la shell può
+  // portarne uno di un altro tool) e l'autenticazione sta nella tabella
+  // provider di config.toml (bearer token).
   #[test]
   fn builds_codex_terminal_script() {
     let script = build_terminal_script(
       Path::new("/Users/x/.nvm/versions/node/v24/bin/codex"),
-      &["--profile".to_string(), "hive".to_string()],
-      &[("HIVE_API_KEY", "sk-test")],
+      &[],
+      &[("CODEX_HOME", "/Users/x/.codex")],
       Path::new("/Users/x/Projects/codex"),
     );
-    assert!(script.contains("export HIVE_API_KEY='sk-test'"));
-    assert!(script.contains("'--profile' 'hive'"));
-    assert!(script.contains("'/Users/x/.nvm/versions/node/v24/bin/codex' '--profile' 'hive'"));
+    assert!(script.contains("export CODEX_HOME='/Users/x/.codex'"));
+    assert!(!script.contains("--profile"));
+    assert!(script.contains("'/Users/x/.nvm/versions/node/v24/bin/codex'\n"));
   }
 
   // Claude Code non prende argomenti: il terminale lo punta ad AI Hive solo
@@ -3790,10 +3816,11 @@ mod tests {
     );
   }
 
-  // Una sola tabella provider serve entrambe le superficità: l'app autentica
-  // col bearer token, il CLI con la variabile d'ambiente che il launcher passa.
+  // Una sola tabella provider serve entrambe le superfici: il bearer token
+  // autentica sia l'app sia la CLI, senza env_key (codex rifiuta di partire
+  // se la variabile dichiarata manca).
   #[test]
-  fn codex_provider_carries_key_for_app_and_cli() {
+  fn codex_provider_carries_bearer_token_for_app_and_cli() {
     let tmp = std::env::temp_dir().join(format!("requrv-launch-test-codex-key-{}", std::process::id()));
     let models = vec![HiveModel { id: "requrv-small-3.8".into(), model_type: "TEXT_GENERATION".into() }];
     configure_chatgpt_app_in(&tmp, "requrv-small-3.8", &models, "requrv_sk_test").unwrap();
@@ -3803,7 +3830,7 @@ mod tests {
       .unwrap();
     let provider = hive_provider_table(&table).expect("hive provider table");
     assert_eq!(provider["experimental_bearer_token"].as_str(), Some("requrv_sk_test"));
-    assert_eq!(provider["env_key"].as_str(), Some("HIVE_API_KEY"));
+    assert!(provider.get("env_key").is_none());
     assert!(chatgpt_app_configured_in(&tmp));
     let _ = std::fs::remove_dir_all(&tmp);
   }
