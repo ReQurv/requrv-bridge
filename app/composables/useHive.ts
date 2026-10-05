@@ -21,6 +21,8 @@ export interface ServiceStatus {
   claude_desktop: boolean
   claude_desktop_app: boolean
   claude_desktop_configured: boolean
+  opencode_configured: boolean
+  claude_code_cli_configured: boolean
 }
 
 export interface AppRestartResult {
@@ -193,17 +195,21 @@ export function surfaceState(st: ServiceStatus | null, surface: ServiceSurface):
     return { installed: st.claude_desktop_app, configured: st.claude_desktop_configured }
   }
   if (surface.service === 'claude_code') {
-    return { installed: st.claude_code_cli, configured: false }
+    return { installed: st.claude_code_cli, configured: st.claude_code_cli_configured }
   }
   if (surface.service === 'hermes') {
     return { installed: surface.kind === 'desktop' ? st.hermes_app : st.hermes_cli, configured: false }
   }
   if (surface.service === 'opencode') {
-    return { installed: surface.kind === 'desktop' ? st.opencode_app : st.opencode_cli, configured: false }
+    return {
+      installed: surface.kind === 'desktop' ? st.opencode_app : st.opencode_cli,
+      configured: st.opencode_configured
+    }
   }
   return {
     installed: surface.kind === 'desktop' ? st.codex_app : st.codex_cli,
-    configured: surface.kind === 'desktop' && st.codex_app_configured
+    // App and CLI read the same ~/.codex/config.toml.
+    configured: st.codex_app_configured
   }
 }
 
@@ -312,7 +318,8 @@ export function useHive() {
     if (!trimmed || saving.value) return false
     saving.value = true
     try {
-      await invoke('set_hive_key', { key: trimmed })
+      // The backend realigns every config it already wrote with the new key.
+      await invoke('set_hive_key', { key: trimmed, model: selectedModel.value })
       key.value = trimmed
       keySaved.value = true
       if (!(await loadModels())) {
@@ -326,9 +333,11 @@ export function useHive() {
       return true
     } catch (error) {
       toast.add({
-        title: 'Salvataggio non riuscito',
+        // The key is saved: only updating an already-written config failed,
+        // and the description says which one.
+        title: 'Chiave salvata, configurazione da aggiornare',
         description: String(error),
-        color: 'error'
+        color: 'warning'
       })
       return false
     } finally {
@@ -405,6 +414,27 @@ export function useHive() {
         await refreshStatus()
         return
       }
+      if (service === 'opencode' && mode === 'app') {
+        // L'app legge la config globale all'avvio: se è già aperta serve il
+        // riavvio, altrimenti la nuova configurazione non viene caricata.
+        const result = await invoke<AppRestartResult>('configure_opencode_app', {
+          model: selectedModel.value,
+          key: key.value.trim()
+        })
+        toast.add({
+          title: 'OpenCode configurato su AI Hive',
+          color: 'success'
+        })
+        if (result.restart_required) {
+          restartTarget.value = 'opencode'
+          restartAction.value = 'configure'
+          restartModalOpen.value = true
+        } else {
+          await invoke('open_opencode_app')
+        }
+        await refreshStatus()
+        return
+      }
       if (service === 'hermes' && mode === 'app') {
         // Anche l'app desktop si configura con sole variabili d'ambiente, ma
         // un'istanza già aperta non può riceverle: serve il riavvio. (La CLI
@@ -474,7 +504,7 @@ export function useHive() {
   async function confirmRestart() {
     const service = restartTarget.value
     restartModalOpen.value = false
-    if (!service || (service !== 'codex' && service !== 'hermes' && service !== 'claude_desktop')) return
+    if (!service || (service !== 'codex' && service !== 'hermes' && service !== 'claude_desktop' && service !== 'opencode')) return
     const label = SERVICE_LABELS[service]
     restarting.value = true
     try {
@@ -489,6 +519,8 @@ export function useHive() {
             key: key.value.trim()
           })
         }
+      } else if (service === 'opencode') {
+        await invoke('restart_opencode_app')
       } else {
         await invoke('restart_hermes_app', {
           model: selectedModel.value,
@@ -522,20 +554,30 @@ export function useHive() {
     })
   }
 
+  // Every target that persists something can be restored; Hermes is env-only,
+  // so it never shows the button.
+  const RESTORE_COMMANDS: Record<ServiceId, string> = {
+    codex: 'restore_chatgpt_app',
+    claude_desktop: 'restore_claude_desktop',
+    opencode: 'restore_opencode',
+    claude_code: 'restore_claude_code_cli',
+    hermes: ''
+  }
+
   async function restoreApp(service: ServiceId) {
-    if (service !== 'codex' && service !== 'claude_desktop') return
-    if (!isTauri.value || restoring.value) return
+    const command = RESTORE_COMMANDS[service]
+    if (!command || !isTauri.value || restoring.value) return
     restoring.value = true
     const label = SERVICE_LABELS[service]
     try {
-      const result = await invoke<AppRestartResult>(
-        service === 'codex' ? 'restore_chatgpt_app' : 'restore_claude_desktop'
-      )
+      // Only the desktop apps read config at startup, so only they need a
+      // restart afterwards to drop the restored state.
+      const result = await invoke<AppRestartResult | null>(command)
       toast.add({
         title: `${label} ripristinato`,
         color: 'success'
       })
-      if (result.restart_required) {
+      if (result?.restart_required) {
         restartTarget.value = service
         restartAction.value = 'restore'
         restartModalOpen.value = true

@@ -57,10 +57,6 @@ pub fn hive_anthropic_base_url() -> String {
   hive_base_url("HIVE_ANTHROPIC_BASE_URL", "https://hive.requrv.ai/api")
 }
 
-// Claude Desktop 3p gateway: claude-* slot IDs resolve to real models here.
-pub fn hive_claude_gateway_base_url() -> String {
-  hive_base_url("HIVE_CLAUDE_GATEWAY_BASE_URL", "https://hive.requrv.ai/api/claude")
-}
 // Le release pubbliche dell'app: la più recente è la candidata aggiornamento.
 pub const GITHUB_LATEST_RELEASE_URL: &str =
   "https://api.github.com/repos/ReQurv/requrv-launch/releases/latest";
@@ -83,32 +79,95 @@ pub fn get_hive_key(app: tauri::AppHandle) -> Result<Option<String>, String> {
     .map(|s| s.to_string()))
 }
 
+// Persist the key (and the model it was verified against) and realign every
+// config this launcher already wrote, so the key on disk can never diverge
+// from the one in the app.
 #[tauri::command]
-pub fn set_hive_key(app: tauri::AppHandle, key: String) -> Result<(), String> {
+pub async fn set_hive_key(app: tauri::AppHandle, key: String, model: String) -> Result<(), String> {
   let key = key.trim();
+  let model = model.trim();
   if key.is_empty() {
     return Err("La chiave non può essere vuota".into());
   }
   let path = key_file_path(&app)?;
+  write_key_file(&path, key, model)?;
+  // The catalog (context window, modalities, reasoning levels) is only needed
+  // by the Codex config, so it is fetched once, here, when one exists.
+  let failures = match home_dir() {
+    Some(home) if !model.is_empty() => {
+      let models = list_hive_models(key.to_string()).await.unwrap_or_default();
+      reapply_persisted_configs(&home, model, key, &models)
+    }
+    _ => Vec::new(),
+  };
+  if !failures.is_empty() {
+    return Err(format!(
+      "Chiave salvata, ma la configurazione esistente non è stata aggiornata: {}",
+      failures.join("; ")
+    ));
+  }
+  Ok(())
+}
+
+fn write_key_file(path: &Path, key: &str, model: &str) -> Result<(), String> {
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
   }
-  if let Ok(old) = std::fs::read_to_string(&path) {
+  if let Ok(old) = std::fs::read_to_string(path) {
     let _ = std::fs::write(path.with_extension("json.bak"), old);
   }
-  let value = serde_json::json!({ "apiKey": key });
-  std::fs::write(path, value.to_string()).map_err(|e| e.to_string())?;
+  let value = serde_json::json!({ "apiKey": key, "model": model });
+  std::fs::write(path, value.to_string()).map_err(|e| e.to_string())
+}
+
+// The .bak holds the previous key in plaintext; deleting the key must not
+// leave it readable on disk.
+fn delete_key_files(path: &Path) -> Result<(), String> {
+  for file in [path.to_path_buf(), path.with_extension("json.bak")] {
+    match std::fs::remove_file(&file) {
+      Ok(()) => {}
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+      Err(e) => return Err(e.to_string()),
+    }
+  }
   Ok(())
 }
 
 #[tauri::command]
 pub fn delete_hive_key(app: tauri::AppHandle) -> Result<(), String> {
-  let path = key_file_path(&app)?;
-  match std::fs::remove_file(path) {
-    Ok(()) => Ok(()),
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-    Err(e) => Err(e.to_string()),
+  delete_key_files(&key_file_path(&app)?)
+}
+
+// A key change must reach every file this launcher already wrote, or the key
+// on disk silently diverges from the one in the app. Only the targets that
+// persist something are touched (Hermes is env-only). Returns the failures so
+// the caller reports them instead of leaving a half-applied key behind.
+fn reapply_persisted_configs(
+  home: &Path,
+  model: &str,
+  key: &str,
+  models: &[HiveModel],
+) -> Vec<String> {
+  let mut failures = Vec::new();
+  if opencode_configured_in(home) {
+    if let Err(e) = write_opencode_config_in(home, model, key).map(|_| ()) {
+      failures.push(format!("OpenCode: {e}"));
+    }
   }
+  if claude_code_configured_in(home) {
+    if let Err(e) = write_claude_code_settings_in(home, model, key) {
+      failures.push(format!("Claude Code: {e}"));
+    }
+  }
+  // Runs even without a model list: the key must reach config.toml/auth.json
+  // either way, and configure_chatgpt_app_in keeps the existing catalog when
+  // the list is empty.
+  if chatgpt_app_configured_in(home) {
+    if let Err(e) = configure_chatgpt_app_in(home, model, models, key) {
+      failures.push(format!("Codex: {e}"));
+    }
+  }
+  failures
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -179,14 +238,17 @@ fn probe_error(status: reqwest::StatusCode, agent: &str, endpoint: &str) -> Opti
   }
 }
 
-// POST an empty body to the gateway endpoint the agent needs. A 4xx from the
-// handler (e.g. 422 validation on the empty body) proves the route exists
-// without invoking a model; only 404 and 5xx are errors. Probing before
-// opening a session fails fast with an actionable message instead of a
+// POST an empty body to the gateway endpoint the agent needs. `base` is the
+// same base URL the agent's own client will use, so the probe proves the route
+// on the host the session will really hit (the OpenAI and Anthropic gateways
+// are separate hosts/proxies and only one of them may expose a given path).
+// A 4xx from the handler (e.g. 422 validation on the empty body) proves the
+// route exists without invoking a model; only 404 and 5xx are errors. Probing
+// before opening a session fails fast with an actionable message instead of a
 // broken TUI.
-async fn assert_endpoint_available(key: &str, endpoint: &str, agent: &str) -> Result<(), String> {
+async fn assert_endpoint_available(base: &str, key: &str, endpoint: &str, agent: &str) -> Result<(), String> {
   let client = reqwest::Client::new();
-  let url = format!("{}{endpoint}", hive_openai_base_url());
+  let url = format!("{base}{endpoint}");
   let response = client
     .post(&url)
     .bearer_auth(key.trim())
@@ -205,14 +267,16 @@ async fn assert_endpoint_available(key: &str, endpoint: &str, agent: &str) -> Re
 // expose POST /responses. The gateway routes only POST on that path (HEAD/GET
 // never complete), so the probe POSTs an empty body.
 async fn assert_responses_available(key: &str) -> Result<(), String> {
-  assert_endpoint_available(key, "/responses", "Codex").await
+  assert_endpoint_available(&hive_openai_base_url(), key, "/responses", "Codex").await
 }
 
-// Agents that speak the Anthropic Messages API (Claude Code, Hermes) need the
-// gateway to expose POST /messages (it must also accept `role: "system"`
-// entries in messages[], which Claude Code v2.x sends).
+// Claude Code speaks the Anthropic Messages API and appends /v1/messages to
+// ANTHROPIC_BASE_URL, so the probe targets the same host+path. The gateway must
+// also accept `role: "system"` entries in messages[], which Claude Code v2.x
+// sends.
 async fn assert_messages_available(key: &str, agent: &str) -> Result<(), String> {
-  assert_endpoint_available(key, "/messages", agent).await
+  let endpoint = "/v1/messages";
+  assert_endpoint_available(&hive_anthropic_base_url(), key, endpoint, agent).await
 }
 
 #[derive(Serialize)]
@@ -232,6 +296,8 @@ pub struct ServiceStatus {
   pub claude_desktop: bool,
   pub claude_desktop_app: bool,
   pub claude_desktop_configured: bool,
+  pub opencode_configured: bool,
+  pub claude_code_cli_configured: bool,
 }
 
 // Reports every launch target separately so the UI can offer the app/terminal
@@ -252,6 +318,9 @@ pub fn check_services() -> ServiceStatus {
   let claude_desktop_app = claude_desktop_app_path().is_some();
   let claude_desktop_configured =
     home_dir().is_some_and(|home| claude_desktop_configured_in(&home));
+  let opencode_configured = home_dir().is_some_and(|home| opencode_configured_in(&home));
+  let claude_code_cli_configured =
+    home_dir().is_some_and(|home| claude_code_configured_in(&home));
   ServiceStatus {
     opencode: opencode_app || opencode_cli,
     codex: codex_app || codex_cli,
@@ -268,6 +337,8 @@ pub fn check_services() -> ServiceStatus {
     claude_desktop: claude_desktop_app,
     claude_desktop_app,
     claude_desktop_configured,
+    opencode_configured,
+    claude_code_cli_configured,
   }
 }
 
@@ -664,12 +735,12 @@ pub async fn launch_service(
   if key.is_empty() {
     return Err("Chiave Hive non salvata".into());
   }
-  // ("codex", "app") is not handled here: the ChatGPT app flow needs a
-  // restart confirmation, so the frontend drives it via configure_chatgpt_app,
-  // open_chatgpt_app and restart_chatgpt_app. ("hermes", "app") is driven the
-  // same way via launch_hermes_app/restart_hermes_app.
+  // Desktop apps that read their config at startup are not handled here: they
+  // need a restart confirmation, so the frontend drives them via their own
+  // configure/open/restart commands — ("codex","app") through
+  // configure_chatgpt_app, ("hermes","app") through launch_hermes_app,
+  // ("opencode","app") through configure_opencode_app.
   match (service.as_str(), mode.as_str()) {
-    ("opencode", "app") => launch_opencode_app(model, key),
     ("opencode", "terminal") => {
       let directory = require_project_directory(project_directory.as_deref())?;
       launch_opencode_cli(&app, model, key, &directory)
@@ -719,7 +790,6 @@ const KNOWN_HIVE_MODEL_OUTPUTS: [&str; 1] = ["text"];
 const KNOWN_HIVE_MODEL_CATALOG_INPUTS: [&str; 2] = ["text", "image"];
 const KNOWN_HIVE_MODEL_REASONING_LEVELS: [&str; 3] = ["low", "medium", "xhigh"];
 const KNOWN_HIVE_MODEL_DEFAULT_REASONING: &str = "xhigh";
-const KNOWN_HIVE_MODEL_REASONING_EFFORT: &str = "medium";
 const DEFAULT_HIVE_CONTEXT: u32 = 128_000;
 const DEFAULT_HIVE_INPUTS: [&str; 1] = ["text"];
 
@@ -739,6 +809,9 @@ fn opencode_model_entry(model: &str) -> serde_json::Value {
   if model == KNOWN_HIVE_MODEL {
     serde_json::json!({
       "name": model,
+      // Without this flag the client hides the thinking-effort control, so the
+      // user cannot pick the effort `options.reasoningEffort` sets.
+      "reasoning": true,
       "limit": {
         "context": KNOWN_HIVE_MODEL_CONTEXT,
         "output": KNOWN_HIVE_MODEL_OUTPUT,
@@ -747,8 +820,17 @@ fn opencode_model_entry(model: &str) -> serde_json::Value {
         "input": KNOWN_HIVE_MODEL_INPUTS,
         "output": KNOWN_HIVE_MODEL_OUTPUTS,
       },
+      // OpenCode's default ladder for a reasoning model is low/medium/high: the
+      // gateway rejects `high` with 502 Bad Gateway, and `xhigh` — which it
+      // does accept — is not in the ladder. Disable the former, add the latter.
+      "variants": {
+        "high": { "disabled": true },
+        "xhigh": { "reasoningEffort": "xhigh" },
+      },
+      // Provider options: the effort sent to the gateway when no variant is
+      // picked.
       "options": {
-        "reasoningEffort": KNOWN_HIVE_MODEL_REASONING_EFFORT,
+        "reasoningEffort": "medium",
       },
     })
   } else {
@@ -849,6 +931,9 @@ fn strip_trailing_commas(input: &str) -> String {
   out
 }
 
+const OPENCODE_SCHEMA_KEY: &str = "$schema";
+const OPENCODE_SCHEMA_URL: &str = "https://opencode.ai/config.json";
+
 // Merge the ReQurv Hive provider block and the default model into the global
 // opencode config, leaving every other field untouched.
 fn merge_hive_provider(config: &mut serde_json::Value, model: &str, key: &str) {
@@ -858,8 +943,8 @@ fn merge_hive_provider(config: &mut serde_json::Value, model: &str, key: &str) {
   let Some(root) = config.as_object_mut() else {
     return;
   };
-  root.entry("$schema".to_string())
-    .or_insert_with(|| serde_json::Value::String("https://opencode.ai/config.json".into()));
+  root.entry(OPENCODE_SCHEMA_KEY.to_string())
+    .or_insert_with(|| serde_json::Value::String(OPENCODE_SCHEMA_URL.into()));
   let provider_block = serde_json::json!({
     "npm": "@ai-sdk/openai-compatible",
     "name": "ReQurv Hive",
@@ -878,6 +963,12 @@ fn merge_hive_provider(config: &mut serde_json::Value, model: &str, key: &str) {
   let mut providers = existing.as_object().cloned().unwrap_or_default();
   providers.insert(OPENCODE_PROVIDER_ID.to_string(), provider_block);
   root.insert("provider".to_string(), serde_json::Value::Object(providers));
+  // A disabled provider is not loaded by opencode, so the model we just set
+  // would resolve to "Model not found". Drop only our own id: the other
+  // entries are the user's choices.
+  if let Some(disabled) = root.get_mut("disabled_providers").and_then(|d| d.as_array_mut()) {
+    disabled.retain(|id| id.as_str() != Some(OPENCODE_PROVIDER_ID));
+  }
   root.insert(
     "model".to_string(),
     serde_json::Value::String(format!("{OPENCODE_PROVIDER_ID}/{model}")),
@@ -898,6 +989,102 @@ fn opencode_config_path_in(home: &Path) -> PathBuf {
   }
   jsonc
 }
+// The backup sits next to the resolved config file and keeps the extension
+// convention of the writer ("opencode.jsonc" -> "opencode.jsonc.bak").
+fn opencode_backup_for(path: &Path) -> PathBuf {
+  let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
+  path.with_extension(format!("{ext}.bak"))
+}
+
+// Which backup of the two candidate extensions exists, if any: the writer
+// picked one file, but an older version may have used the other name.
+fn opencode_backup_path_in(home: &Path) -> Option<PathBuf> {
+  let dir = home.join(".config").join("opencode");
+  ["opencode.jsonc", "opencode.json"]
+    .iter()
+    .map(|name| opencode_backup_for(&dir.join(name)))
+    .find(|backup| backup.exists())
+}
+
+// True when the global config is pointed at AI Hive by this launcher.
+fn opencode_configured_in(home: &Path) -> bool {
+  let Ok(raw) = std::fs::read_to_string(opencode_config_path_in(home)) else {
+    return false;
+  };
+  let Ok(cleaned) =
+    serde_json::from_str::<serde_json::Value>(&strip_trailing_commas(&strip_jsonc_comments(&raw)))
+  else {
+    return false;
+  };
+  cleaned
+    .get("provider")
+    .and_then(|p| p.get(OPENCODE_PROVIDER_ID))
+    .and_then(|p| p.get("options"))
+    .and_then(|o| o.get("baseURL"))
+    .and_then(|v| v.as_str())
+    == Some(hive_openai_base_url().as_str())
+}
+
+// Back to the pre-Hive config: the original file when it was backed up, or a
+// stripped config (foreign providers and models untouched) when it was not.
+fn restore_opencode_config_in(home: &Path) -> Result<(), String> {
+  let path = opencode_config_path_in(home);
+  if let Some(backup) = opencode_backup_path_in(home) {
+    std::fs::copy(&backup, &path)
+      .map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+    std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    return Ok(());
+  }
+  if !path.exists() {
+    return Ok(());
+  }
+  let raw = std::fs::read_to_string(&path)
+    .map_err(|e| format!("Impossibile leggere {}: {e}", path.display()))?;
+  let cleaned = strip_trailing_commas(&strip_jsonc_comments(&raw));
+  let mut config: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
+    format!("{} non è un JSON valido: {e}. Correggi il file e riprova.", path.display())
+  })?;
+  if let Some(root) = config.as_object_mut() {
+    if let Some(providers) = root.get_mut("provider").and_then(|p| p.as_object_mut()) {
+      providers.remove(OPENCODE_PROVIDER_ID);
+    }
+    if root.get("provider").and_then(|p| p.as_object()).is_some_and(|p| p.is_empty()) {
+      root.remove("provider");
+    }
+    // Only a Hive model is ours; a model chosen for another provider stays.
+    if root
+      .get("model")
+      .and_then(|v| v.as_str())
+      .is_some_and(|m| m.starts_with(&format!("{OPENCODE_PROVIDER_ID}/")))
+    {
+      root.remove("model");
+    }
+    // $schema is only dropped when it is the URL this launcher writes; losing
+    // it is harmless, and a foreign schema reference must stay.
+    if root.get(OPENCODE_SCHEMA_KEY).and_then(|v| v.as_str()) == Some(OPENCODE_SCHEMA_URL) {
+      root.remove(OPENCODE_SCHEMA_KEY);
+    }
+  }
+  if config.as_object().is_some_and(|root| root.is_empty()) {
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    return Ok(());
+  }
+  let mut rendered = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+  rendered.push('\n');
+  std::fs::write(&path, rendered)
+    .map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))
+}
+
+// Restore the pre-Hive global config and report whether a running desktop
+// instance must be restarted to drop the Hive provider.
+#[tauri::command]
+pub fn restore_opencode() -> Result<AppRestartResult, String> {
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  restore_opencode_config_in(&home)?;
+  Ok(AppRestartResult {
+    restart_required: opencode_app_running(),
+  })
+}
 
 // Back up and rewrite the global opencode config with the Hive provider and
 // the selected model. Refuses to touch the file when it cannot be parsed.
@@ -909,13 +1096,20 @@ fn write_opencode_config_in(home: &Path, model: &str, key: &str) -> Result<PathB
   let mut config = if path.exists() {
     let raw = std::fs::read_to_string(&path)
       .map_err(|e| format!("Impossibile leggere {}: {e}", path.display()))?;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("json");
-    let backup = path.with_extension(format!("{ext}.bak"));
-    let _ = std::fs::write(&backup, raw.as_str());
     let cleaned = strip_trailing_commas(&strip_jsonc_comments(&raw));
-    serde_json::from_str(&cleaned).map_err(|e| {
+    let parsed: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
       format!("{} non è un JSON valido: {e}. Correggi il file e riprova.", path.display())
-    })?
+    })?;
+    // Backup una-tantum e solo se il file non è ancora il nostro: altrimenti il
+    // secondo lancio (o un cambio di chiave) salva come "originale" il file
+    // già su Hive e il ripristino non riporta più indietro nulla.
+    if !opencode_configured_in(home) {
+      let backup = opencode_backup_for(&path);
+      if !backup.exists() {
+        let _ = std::fs::write(&backup, raw.as_str());
+      }
+    }
+    parsed
   } else {
     serde_json::json!({})
   };
@@ -946,18 +1140,100 @@ fn open_app_bundle(bundle: &Path, label: &str) -> Result<(), String> {
     .map_err(|e| format!("Impossibile avviare {label}: {e}"))
 }
 
-// Fail fast on a missing bundle before touching the user's config file: the
-// app reads the Hive provider from the global opencode config.
+// True when the OpenCode desktop app is live. `pgrep -x` is case-sensitive and
+// the bundle executable is "OpenCode", so the lowercase CLI is not matched.
 #[cfg(target_os = "macos")]
-fn launch_opencode_app(model: &str, key: &str) -> Result<(), String> {
-  let bundle = opencode_app_path()
-    .ok_or_else(|| String::from("OpenCode.app non trovato in /Applications: installalo e riprova."))?;
-  write_opencode_config(model, key)?;
-  open_app_bundle(&bundle, "OpenCode.app")
+fn opencode_app_running() -> bool {
+  Command::new("pgrep")
+    .args(["-x", "OpenCode"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .is_ok_and(|s| s.success())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn launch_opencode_app(_model: &str, _key: &str) -> Result<(), String> {
+fn opencode_app_running() -> bool {
+  false
+}
+
+// Point the OpenCode desktop app at AI Hive: write the global config and report
+// whether a running instance must be restarted, because the app reads that
+// config only at startup.
+#[tauri::command]
+#[cfg(target_os = "macos")]
+pub fn configure_opencode_app(model: String, key: String) -> Result<AppRestartResult, String> {
+  let model = model.trim();
+  let key = key.trim();
+  if model.is_empty() {
+    return Err("Nessun modello selezionato".into());
+  }
+  if key.is_empty() {
+    return Err("Chiave Hive non salvata".into());
+  }
+  if opencode_app_path().is_none() {
+    return Err(String::from("OpenCode.app non trovato in /Applications: installalo e riprova."));
+  }
+  write_opencode_config(model, key)?;
+  Ok(AppRestartResult {
+    restart_required: opencode_app_running(),
+  })
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "macos"))]
+pub fn configure_opencode_app(_model: String, _key: String) -> Result<AppRestartResult, String> {
+  Err(String::from("L'app OpenCode è disponibile solo su macOS."))
+}
+
+#[tauri::command]
+#[cfg(target_os = "macos")]
+pub fn open_opencode_app() -> Result<(), String> {
+  let bundle = opencode_app_path()
+    .ok_or_else(|| String::from("OpenCode.app non trovato in /Applications: installalo e riprova."))?;
+  open_app_bundle(&bundle, "OpenCode.app")
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "macos"))]
+pub fn open_opencode_app() -> Result<(), String> {
+  Err(String::from("L'app OpenCode è disponibile solo su macOS."))
+}
+
+// Quit the running instance (if any) and relaunch it so it loads the config
+// written by configure_opencode_app.
+#[cfg(target_os = "macos")]
+fn quit_and_reopen_opencode() -> Result<(), String> {
+  let bundle = opencode_app_path()
+    .ok_or_else(|| String::from("OpenCode.app non trovato in /Applications: installalo e riprova."))?;
+  if opencode_app_running() {
+    Command::new("pkill")
+      .args(["-x", "OpenCode"])
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .map_err(|e| format!("Impossibile chiudere OpenCode: {e}"))?;
+    for _ in 0..10 {
+      if !opencode_app_running() {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+  }
+  open_app_bundle(&bundle, "OpenCode.app")
+}
+
+#[tauri::command]
+#[cfg(target_os = "macos")]
+pub fn restart_opencode_app() -> Result<(), String> {
+  quit_and_reopen_opencode()
+}
+
+#[tauri::command]
+#[cfg(not(target_os = "macos"))]
+pub fn restart_opencode_app() -> Result<(), String> {
   Err(String::from("L'app OpenCode è disponibile solo su macOS."))
 }
 
@@ -1030,14 +1306,6 @@ fn codex_catalog_path_in(home: &Path) -> PathBuf {
   codex_dir_in(home).join(HIVE_CATALOG_FILE)
 }
 
-// Model catalog for the Codex CLI: separate file from the ChatGPT app's so
-// the app's restore (which removes its own catalog) never breaks the CLI.
-const HIVE_CLI_CATALOG_FILE: &str = "hive-cli-models.json";
-
-fn codex_cli_catalog_path_in(home: &Path) -> PathBuf {
-  codex_dir_in(home).join(HIVE_CLI_CATALOG_FILE)
-}
-
 // model_catalog_json requires Codex >= 0.134.0; older CLIs fail to start
 // with an opaque config error, so check the version up front.
 const CODEX_MIN_VERSION: &str = "0.134.0";
@@ -1068,17 +1336,6 @@ fn check_codex_version(bin: &Path) -> Result<(), String> {
     ));
   }
   Ok(())
-}
-
-// Dedicated CLI profile: the catalog (context window, modalities, reasoning
-// levels) travels with the profile so `codex --profile hive` works even when
-// the root config belongs to the ChatGPT app.
-fn render_codex_cli_profile(model: &str, catalog_path: &Path) -> String {
-  format!(
-    "model = \"{model}\"\nmodel_provider = \"hive\"\nmodel_catalog_json = \"{catalog}\"\n\n[model_providers.hive]\nname = \"ReQurv AI Hive\"\nbase_url = \"{base}\"\nwire_api = \"responses\"\nenv_key = \"HIVE_API_KEY\"\n",
-    catalog = catalog_path.to_string_lossy(),
-    base = hive_openai_base_url(),
-  )
 }
 
 // The catalog schema takes each reasoning level as a `ReasoningEffortPreset`
@@ -1206,24 +1463,35 @@ fn chatgpt_app_configured_in(home: &Path) -> bool {
 fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key: &str) -> Result<(), String> {
   let dir = codex_dir_in(home);
   std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-
+  // Read before writing anything: once config.toml holds the Hive provider,
+  // this returns true and the user's files would never be backed up.
+  let was_ours = chatgpt_app_configured_in(home);
   let catalog_path = codex_catalog_path_in(home);
-  let catalog = build_hive_catalog(models);
-  let rendered = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
-  std::fs::write(&catalog_path, rendered + "\n")
-    .map_err(|e| format!("Impossibile scrivere {}: {e}", catalog_path.display()))?;
+  // An empty list means the caller could not fetch the models (e.g. the key
+  // change path). Keeping the catalog on disk is right: overwriting it with
+  // {"models": []} would empty the picker and drop the context windows.
+  if !models.is_empty() {
+    let catalog = build_hive_catalog(models);
+    let rendered = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
+    std::fs::write(&catalog_path, rendered + "\n")
+      .map_err(|e| format!("Impossibile scrivere {}: {e}", catalog_path.display()))?;
+  }
 
   let config_path = codex_config_path_in(home);
   let backup_path = codex_config_backup_path_in(home);
   let mut table: toml::Table = if config_path.exists() {
     let raw = std::fs::read_to_string(&config_path)
       .map_err(|e| format!("Impossibile leggere {}: {e}", config_path.display()))?;
-    if !backup_path.exists() {
+    let parsed: toml::Table = raw.parse().map_err(|e| {
+      format!("{} non è un TOML valido: {e}. Correggi il file e riprova.", config_path.display())
+    })?;
+    // Backup only while the config is not ours yet: this writer runs on every
+    // CLI launch and on every key change, so a plain "!backup exists" guard
+    // would snapshot the Hive config as the user's "original".
+    if !backup_path.exists() && !was_ours {
       let _ = std::fs::write(&backup_path, raw.as_str());
     }
-    raw.parse().map_err(|e| {
-      format!("{} non è un TOML valido: {e}. Correggi il file e riprova.", config_path.display())
-    })?
+    parsed
   } else {
     toml::Table::new()
   };
@@ -1239,6 +1507,10 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
   provider.insert("wire_api".into(), toml::Value::String("responses".into()));
   provider.insert("supports_websockets".into(), toml::Value::Boolean(false));
   provider.insert("experimental_bearer_token".into(), toml::Value::String(key.to_string()));
+  // ChatGPT.app authenticates with the bearer token above, the CLI reads the
+  // key from the environment variable the launcher exports: both surfaces
+  // share this one provider table.
+  provider.insert("env_key".into(), toml::Value::String("HIVE_API_KEY".into()));
   let providers = table
     .entry("model_providers")
     .or_insert_with(|| toml::Value::Table(toml::Table::new()));
@@ -1254,7 +1526,9 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
   // keeping the previous content in .bak for the restore.
   let auth_path = codex_auth_path_in(home);
   let auth_backup = codex_auth_backup_path_in(home);
-  if auth_path.exists() && !auth_backup.exists() {
+  // Same reasoning as the config backup: an auth.json this launcher already
+  // wrote must not become the user's "original" on the next launch.
+  if auth_path.exists() && !auth_backup.exists() && !was_ours {
     let raw = std::fs::read_to_string(&auth_path)
       .map_err(|e| format!("Impossibile leggere {}: {e}", auth_path.display()))?;
     let _ = std::fs::write(&auth_backup, raw.as_str());
@@ -1356,6 +1630,13 @@ fn restore_chatgpt_app_in(home: &Path, key: &str) -> Result<(), String> {
 
   if strip_catalog {
     let _ = std::fs::remove_file(codex_catalog_path_in(home));
+  }
+
+  // Files written by earlier versions of the launcher (dedicated CLI profile
+  // and its own catalog): nothing reads them any more, so the restore takes
+  // them away instead of leaving them behind in ~/.codex.
+  for legacy in ["hive.config.toml", "hive.config.bak", "hive-cli-models.json"] {
+    let _ = std::fs::remove_file(codex_dir_in(home).join(legacy));
   }
 
   Ok(())
@@ -1476,13 +1757,15 @@ pub fn restore_chatgpt_app(app: tauri::AppHandle) -> Result<AppRestartResult, St
 // ---------------------------------------------------------------------------
 // Third-party ("3p") deployment mode: the managed profile in configLibrary
 // declares the gateway URL, credential and model rows; the app sends the
-// claude-* slot to POST /v1/messages and the gateway resolves it to the real
-// model. The gateway base URL is configurable via HIVE_CLAUDE_GATEWAY_BASE_URL
-// (see hive_claude_gateway_base_url); the default is the production gateway.
+// claude-* slot to POST /v1/messages on the same Anthropic gateway Claude Code
+// uses, and the gateway resolves it to the real model.
 // Fixed profile id (same convention as Ollama's launcher); opaque to the app.
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000000114";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "ReQurv AI Hive";
-// The claude-* slot on the wire; the gateway maps it to LlmModel.claudeSlot.
+// Claude Desktop's 3p mode drops any inferenceModels entry whose name is not
+// an Anthropic model id, so the profile advertises an Anthropic id and the
+// gateway maps it to the selected Hive model (org alias or claude-* fallback);
+// labelOverride is what the user actually sees.
 const CLAUDE_DESKTOP_SLOT: &str = "claude-sonnet-5";
 const CLAUDE_DESKTOP_BACKUP: &str = "hive.bak";
 
@@ -1572,7 +1855,7 @@ fn claude_desktop_profile_value(model: &str, key: &str) -> serde_json::Value {
     "inferenceCredentialKind": "static",
     "inferenceGatewayApiKey": key,
     "inferenceGatewayAuthScheme": "x-api-key",
-    "inferenceGatewayBaseUrl": hive_claude_gateway_base_url(),
+    "inferenceGatewayBaseUrl": hive_anthropic_base_url(),
     "inferenceModels": [{
       "name": CLAUDE_DESKTOP_SLOT,
       "labelOverride": format!("{model} (ReQurv)"),
@@ -1596,7 +1879,7 @@ fn claude_desktop_configured_in(home: &Path) -> bool {
   let Ok(profile) = read_json_allow_missing(&paths.profile) else {
     return false;
   };
-  profile.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_claude_gateway_base_url()))
+  profile.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_anthropic_base_url()))
 }
 
 fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
@@ -1680,7 +1963,7 @@ fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
 fn claude_desktop_our_profile(path: &Path) -> bool {
   read_json_allow_missing(path)
     .map(|p| {
-      p.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_claude_gateway_base_url()))
+      p.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_anthropic_base_url()))
     })
     .unwrap_or(false)
 }
@@ -1689,7 +1972,7 @@ fn claude_desktop_our_profile(path: &Path) -> bool {
 // app's profile, otherwise Claude Desktop would be left without a working
 // model.
 async fn assert_claude_gateway_available(key: &str) -> Result<(), String> {
-  let url = format!("{}/v1/models", hive_claude_gateway_base_url());
+  let url = format!("{}/v1/models", hive_anthropic_base_url());
   let response = reqwest::Client::new()
     .get(&url)
     .header("x-api-key", key.trim())
@@ -1843,33 +2126,19 @@ async fn launch_codex_cli(
   check_codex_version(&bin)?;
 
   assert_responses_available(key).await?;
-
-  let codex_dir = home_dir()
-    .ok_or_else(|| "Home directory non trovata".to_string())?
-    .join(".codex");
-  std::fs::create_dir_all(&codex_dir).map_err(|e| e.to_string())?;
-
-  let profile_path = codex_dir.join("hive.config.toml");
-  if let Ok(old) = std::fs::read_to_string(&profile_path) {
-    let _ = std::fs::write(profile_path.with_extension("toml.bak"), old);
+  // An empty catalog would replace the models ChatGPT.app already knows.
+  if models.is_empty() {
+    return Err("Nessun modello disponibile da AI Hive".into());
   }
 
-  // The catalog tells Codex the real context window, input modalities and
-  // reasoning levels of the Hive models (without it the CLI assumes
-  // conservative defaults and the model is missing from /models).
-  let catalog_path = codex_cli_catalog_path_in(
-    &home_dir().ok_or_else(|| "Home directory non trovata".to_string())?,
-  );
-  let catalog = build_hive_catalog(models);
-  let rendered = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
-  std::fs::write(&catalog_path, rendered + "\n").map_err(|e| e.to_string())?;
+  // One configuration for both surfaces: the CLI reads ~/.codex/config.toml
+  // like ChatGPT.app does, so a codex typed by hand also goes to AI Hive. The
+  // catalog travels with it (context window, modalities, reasoning levels).
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  configure_chatgpt_app_in(&home, model, models, key)?;
 
-  let profile = render_codex_cli_profile(model, &catalog_path);
-  std::fs::write(&profile_path, profile).map_err(|e| e.to_string())?;
-
-  let args = vec!["--profile".to_string(), "hive".to_string()];
   let env: Vec<(&str, &str)> = vec![("HIVE_API_KEY", key)];
-  launch_cli(app, "codex", &bin, &args, &env, working_directory)
+  launch_cli(app, "codex", &bin, &[], &env, working_directory)
 }
 
 // Claude Code speaks the Anthropic Messages API, so the launcher only sets
@@ -1877,6 +2146,9 @@ async fn launch_codex_cli(
 // through the gateway (it appends /v1/messages), ANTHROPIC_API_KEY is sent as
 // the x-api-key header in place of a Claude subscription, and ANTHROPIC_MODEL
 // pins the selected Hive model. No file is persisted, so nothing to restore.
+// ANTHROPIC_AUTH_TOKEN is the only other credential the client accepts, and
+// it is not used: with the token alone (and no API key) 2.1.289 answers "Not
+// logged in", so the API key is the only working credential here.
 // The gateway configuration for Claude Code: the same env vars the Hermes
 // Agent mode uses, because both run the Claude Agent SDK. The context window
 // is the real limit for the known model (conservative default otherwise):
@@ -1897,6 +2169,174 @@ fn claude_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
   ]
 }
 
+// Claude Code's only global settings file; the client applies its env block
+// over the process environment, so persisting it here makes the configuration
+// survive the launcher instead of dying with the terminal that started it.
+fn claude_code_settings_path_in(home: &Path) -> PathBuf {
+  home.join(".claude").join("settings.json")
+}
+
+// Merge the Hive env into the user settings: every existing top-level key and
+// every non-Hive env entry survives. Refuses to write when the file is not
+// valid JSON, so a broken settings.json is never overwritten.
+fn write_claude_code_settings_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
+  let path = claude_code_settings_path_in(home);
+  std::fs::create_dir_all(home.join(".claude")).map_err(|e| e.to_string())?;
+  let mut settings = if path.exists() {
+    let raw = std::fs::read_to_string(&path)
+      .map_err(|e| format!("Impossibile leggere {}: {e}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+      format!("{} non è un JSON valido: {e}. Correggi il file e riprova.", path.display())
+    })?;
+    // Solo se il file non è ancora il nostro: un secondo lancio (o un cambio
+    // di chiave) deve trovare il backup già fatto, non sostituirlo con la
+    // versione su Hive.
+    if !claude_code_configured_in(home) {
+      backup_once(&path)?;
+    }
+    parsed
+  } else {
+    serde_json::json!({})
+  };
+  let Some(root) = settings.as_object_mut() else {
+    return Err(format!("{} non è un oggetto JSON", path.display()));
+  };
+  let mut env = root
+    .get("env")
+    .and_then(|v| v.as_object())
+    .cloned()
+    .unwrap_or_default();
+  for (name, value) in claude_hive_env(model, key) {
+    env.insert(name.to_string(), serde_json::Value::String(value));
+  }
+  // Settings files are merged, not replaced: a user token left here would be
+  // sent as a Bearer header and win over ANTHROPIC_API_KEY.
+  env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), serde_json::Value::String(String::new()));
+  root.insert("env".to_string(), serde_json::Value::Object(env));
+  write_json(&path, &settings)?;
+  // Never fatal: a failure here only brings the consent prompt back.
+  let _ = approve_claude_custom_api_key_in(home, key);
+  Ok(())
+}
+
+// Claude Code asks whether to use an ANTHROPIC_API_KEY it has not seen yet,
+// once per distinct key, and blocks the session until answered (it also stops
+// using the key when the answer is "No", which is why a refusal used to break
+// the session). The answer lives in ~/.claude.json as
+// customApiKeyResponses.approved, keyed by the last 20 characters of the key
+// (its own fingerprint: `key.trim().slice(-20)`). Recording the approval here,
+// every time the key is written, keeps the launcher from putting that prompt
+// in front of the user at every start and after every key change. An
+// unreadable or non-object file is left alone: it belongs to Claude, and the
+// prompt returning is better than losing its state.
+fn approve_claude_custom_api_key_in(home: &Path, key: &str) -> Result<(), String> {
+  let key = key.trim();
+  if key.is_empty() {
+    return Ok(());
+  }
+  let fingerprint: String = key
+    .chars()
+    .rev()
+    .take(20)
+    .collect::<Vec<char>>()
+    .into_iter()
+    .rev()
+    .collect();
+  let path = home.join(".claude.json");
+  let mut config: serde_json::Value = if path.exists() {
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    if raw.trim().is_empty() {
+      serde_json::json!({})
+    } else {
+      serde_json::from_str(&raw).map_err(|e| e.to_string())?
+    }
+  } else {
+    serde_json::json!({})
+  };
+  let Some(root) = config.as_object_mut() else {
+    return Err(format!("{} non è un oggetto JSON", path.display()));
+  };
+  let responses = root
+    .entry("customApiKeyResponses")
+    .or_insert_with(|| serde_json::json!({ "approved": [], "rejected": [] }));
+  if !responses.is_object() {
+    *responses = serde_json::json!({ "approved": [], "rejected": [] });
+  }
+  let responses = responses.as_object_mut().expect("objecto appena forzato");
+  // A previous "No" for this same key must not outrank the approval.
+  if let Some(rejected) = responses
+    .get_mut("rejected")
+    .and_then(|list| list.as_array_mut())
+  {
+    rejected.retain(|value| value.as_str() != Some(fingerprint.as_str()));
+  }
+  let approved = responses
+    .entry("approved")
+    .or_insert_with(|| serde_json::json!([]));
+  if !approved.is_array() {
+    *approved = serde_json::json!([]);
+  }
+  let approved = approved.as_array_mut().expect("array appena forzato");
+  if !approved
+    .iter()
+    .any(|value| value.as_str() == Some(fingerprint.as_str()))
+  {
+    approved.push(serde_json::Value::String(fingerprint));
+  }
+  write_json(&path, &config)
+}
+
+
+// True when the user settings are the ones this launcher wrote.
+fn claude_code_configured_in(home: &Path) -> bool {
+  read_json_allow_missing(&claude_code_settings_path_in(home))
+    .map(|settings| {
+      settings.get("env").and_then(|e| e.get("ANTHROPIC_BASE_URL")).and_then(|v| v.as_str())
+        == Some(hive_anthropic_base_url().as_str())
+    })
+    .unwrap_or(false)
+}
+
+fn restore_claude_code_settings_in(home: &Path) -> Result<(), String> {
+  let path = claude_code_settings_path_in(home);
+  let backup = backup_path_for(&path);
+  if backup.exists() {
+    std::fs::copy(&backup, &path)
+      .map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+    std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    return Ok(());
+  }
+  if !path.exists() {
+    return Ok(());
+  }
+  let mut settings = read_json_allow_missing(&path)?;
+  if !claude_code_configured_in(home) {
+    return Ok(());
+  }
+  if let Some(root) = settings.as_object_mut() {
+    if let Some(env) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+      for name in claude_hive_env("", "").iter().map(|(name, _)| *name) {
+        env.remove(name);
+      }
+      env.remove("ANTHROPIC_AUTH_TOKEN");
+      if env.is_empty() {
+        root.remove("env");
+      }
+    }
+  }
+  if settings.as_object().is_some_and(|root| root.is_empty()) {
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    return Ok(());
+  }
+  write_json(&path, &settings)
+}
+
+#[tauri::command]
+pub fn restore_claude_code_cli() -> Result<(), String> {
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  restore_claude_code_settings_in(&home)
+}
+
 async fn launch_claude_cli(
   app: &tauri::AppHandle,
   model: &str,
@@ -1907,6 +2347,12 @@ async fn launch_claude_cli(
     .ok_or_else(|| String::from("Claude Code non è installato. Installalo con npm install -g @anthropic-ai/claude-code."))?;
 
   assert_messages_available(key, "Claude Code").await?;
+
+  // Persist the routing in ~/.claude/settings.json: the client applies it over
+  // the process environment, so a claude started by hand (no Bridge, no
+  // exported vars) also goes to AI Hive.
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  write_claude_code_settings_in(&home, model, key)?;
 
   let hive_env = claude_hive_env(model, key);
   let env: Vec<(&str, &str)> = hive_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1943,7 +2389,7 @@ async fn launch_hermes_cli(
   let bin = hermes_cli_path()
     .ok_or_else(|| format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."))?;
 
-  assert_endpoint_available(key, "/chat/completions", "Hermes").await?;
+  assert_endpoint_available(&hive_openai_base_url(), key, "/chat/completions", "Hermes").await?;
 
   let env = hermes_cli_env(key);
   let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -1982,6 +2428,7 @@ fn find_hermes_bundle_in(dirs: &[PathBuf]) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = entries
       .flatten()
       .filter_map(|e| e.file_name().to_str().filter(|n| is_hermes_bundle(n)).map(|_| e.path()))
+      .filter(|p| !is_setup_bundle(p))
       .collect();
     // Deterministic pick across filesystems.
     found.sort();
@@ -1990,6 +2437,30 @@ fn find_hermes_bundle_in(dirs: &[PathBuf]) -> Option<PathBuf> {
     }
   }
   None
+}
+
+// The bootstrap installer ships as a bundle named like the agent
+// (com.nousresearch.hermes.setup) but its binary ignores the Hive environment
+// and exits at once, so treating it as an installation makes the launch a
+// silent no-op.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_setup_bundle_id(identifier: &str) -> bool {
+  identifier.ends_with(".setup")
+}
+
+#[cfg(target_os = "macos")]
+fn is_setup_bundle(bundle: &Path) -> bool {
+  let Ok(output) = Command::new("plutil")
+    .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+    .arg(bundle.join("Contents").join("Info.plist"))
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+  else {
+    return false;
+  };
+  output.status.success() && is_setup_bundle_id(String::from_utf8_lossy(&output.stdout).trim())
 }
 
 // Detected Hermes installation: the .app bundle on macOS, the binary itself
@@ -2259,7 +2730,7 @@ pub async fn launch_hermes_app(model: String, key: String) -> Result<AppRestartR
   if hermes_app_path().is_none() {
     return Err(format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."));
   }
-  assert_endpoint_available(key, "/chat/completions", "Hermes").await?;
+  assert_endpoint_available(&hive_openai_base_url(), key, "/chat/completions", "Hermes").await?;
   if hermes_app_running() {
     return Ok(AppRestartResult { restart_required: true });
   }
@@ -2536,6 +3007,82 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateInfo, Stri
 mod tests {
   use super::*;
 
+  // hive.json tiene anche il modello verificato, così un cambio di chiave
+  // sa quale modello rimettere nelle config già scritte.
+  #[test]
+  fn key_file_keeps_key_and_model() {
+    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let path = tmp.join("hive.json");
+    write_key_file(&path, "requrv_sk_vecchia", "requrv-small-3.8").unwrap();
+    write_key_file(&path, "requrv_sk_nuova", "requrv-small-3.8").unwrap();
+    let saved: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["apiKey"], "requrv_sk_nuova");
+    assert_eq!(saved["model"], "requrv-small-3.8");
+
+    // Il .bak contiene la chiave precedente in chiaro: cancellare la chiave
+    // deve portare via anche quello.
+    assert!(path.with_extension("json.bak").exists());
+    delete_key_files(&path).unwrap();
+    assert!(!path.exists());
+    assert!(!path.with_extension("json.bak").exists());
+    // Idempotente: cancellare di nuovo non deve fallire.
+    delete_key_files(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Il riallineamento scrive la chiave nuova solo nei target già configurati e
+  // non tocca i backup (che devono restare lo stato pre-Hive).
+  #[test]
+  fn reapply_writes_the_new_key_into_configured_targets_only() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-launch-test-reapply-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let oc_dir = tmp.join(".config").join("opencode");
+    std::fs::create_dir_all(&oc_dir).unwrap();
+    std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+    // Config utente preesistenti: il ripristino deve tornare a queste.
+    let user_opencode = r#"{ "theme": "dark" }"#;
+    let user_settings = r#"{ "env": { "FOO": "bar" } }"#;
+    std::fs::write(oc_dir.join("opencode.jsonc"), user_opencode).unwrap();
+    let settings_path = claude_code_settings_path_in(&tmp);
+    std::fs::write(&settings_path, user_settings).unwrap();
+
+    write_opencode_config_in(&tmp, "requrv-small-3.8", "requrv_sk_vecchia").unwrap();
+    write_claude_code_settings_in(&tmp, "requrv-small-3.8", "requrv_sk_vecchia").unwrap();
+
+    // Nessun target Codex è configurato qui, quindi il catalogo non serve.
+    let failures = reapply_persisted_configs(&tmp, "requrv-medium-4", "requrv_sk_nuova", &[]);
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let opencode: serde_json::Value = serde_json::from_str(
+      &std::fs::read_to_string(opencode_config_path_in(&tmp)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(opencode["provider"]["requrv-hive"]["options"]["apiKey"], "requrv_sk_nuova");
+    assert_eq!(opencode["model"], "requrv-hive/requrv-medium-4");
+    assert!(opencode_configured_in(&tmp));
+
+    let settings: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "requrv_sk_nuova");
+    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "requrv-medium-4");
+    assert_eq!(settings["env"]["FOO"], "bar");
+    assert!(claude_code_configured_in(&tmp));
+
+    // Il riallineamento non deve aver scambiato il backup con la versione Hive:
+    // il ripristino torna al file originale dell'utente, senza chiave.
+    assert_eq!(std::fs::read_to_string(backup_path_for(&settings_path)).unwrap(), user_settings);
+    restore_claude_code_settings_in(&tmp).unwrap();
+    assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), user_settings);
+    assert!(!claude_code_configured_in(&tmp));
+    restore_opencode_config_in(&tmp).unwrap();
+    assert_eq!(std::fs::read_to_string(opencode_config_path_in(&tmp)).unwrap(), user_opencode);
+    assert!(!opencode_configured_in(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
   #[test]
   fn parses_local_env_file() {
     let entries = local_env_entries(
@@ -2637,6 +3184,129 @@ mod tests {
     assert!(script.contains("'/Users/x/.local/bin/claude'\necho \"\""));
   }
 
+  // La configurazione vive nel file: il merge conserva hooks, theme e le chiavi
+  // env non nostre, e azzera il token Bearer perché i file vengono uniti.
+  #[test]
+  fn claude_code_settings_merge_preserves_user_keys_and_env() {
+    let home = claude_code_test_home();
+    let path = claude_code_settings_path_in(&home);
+    let original_raw = serde_json::to_string_pretty(&serde_json::json!({
+      "theme": "dark",
+      "hooks": { "PreToolUse": [] },
+      "env": { "FOO": "bar" }
+    }))
+    .unwrap()
+    + "\n";
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &original_raw).unwrap();
+
+    write_claude_code_settings_in(&home, "requrv-small-3.8", "requrv_sk_test").unwrap();
+
+    let settings: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(settings["theme"], "dark");
+    assert!(settings["hooks"].is_object());
+    assert_eq!(settings["env"]["FOO"], "bar");
+    assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], hive_anthropic_base_url());
+    assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "requrv_sk_test");
+    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "requrv-small-3.8");
+    assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "");
+    assert!(claude_code_configured_in(&home));
+
+    // Il ripristino torna al file originale byte per byte e rimuove il backup.
+    restore_claude_code_settings_in(&home).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original_raw);
+    assert!(!backup_path_for(&path).exists());
+    assert!(!claude_code_configured_in(&home));
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  // Claude Code chiede il consenso per ogni chiave nuova e, se rispondi "No",
+  // smette di usare la chiave: il launcher registra l'approvazione da solo.
+  #[test]
+  fn claude_code_preapproves_the_custom_api_key() {
+    let home = claude_code_test_home();
+    let path = home.join(".claude.json");
+    std::fs::write(
+      &path,
+      serde_json::to_string_pretty(&serde_json::json!({
+        "numStartups": 7,
+        "customApiKeyResponses": {
+          "approved": ["00000000000000000000"],
+          "rejected": ["requrv_sk_vecchia"]
+        }
+      }))
+      .unwrap(),
+    )
+    .unwrap();
+
+    let key = "requrv_sk_abcdefghijklmnopqrstuvwxyz0123456789";
+    let fingerprint = "qrstuvwxyz0123456789";
+    write_claude_code_settings_in(&home, "requrv-small-3.8", key).unwrap();
+    // Un secondo lancio non deve duplicare la voce.
+    write_claude_code_settings_in(&home, "requrv-small-3.8", key).unwrap();
+
+    let config: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let approved = config["customApiKeyResponses"]["approved"]
+      .as_array()
+      .cloned()
+      .unwrap();
+    assert_eq!(config["numStartups"], 7, "lo stato di Claude resta intatto");
+    assert_eq!(approved.len(), 2);
+    assert!(approved.contains(&serde_json::json!(fingerprint)));
+
+    // Un "No" sulla stessa chiave non può sopravvivere all'approvazione, e un
+    // rifiuto su una chiave diversa resta intatto.
+    let mut config = config;
+    config["customApiKeyResponses"]["rejected"] =
+      serde_json::json!(["requrv_sk_vecchia", fingerprint]);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    write_claude_code_settings_in(&home, "requrv-small-3.8", key).unwrap();
+    let config: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+      config["customApiKeyResponses"]["rejected"],
+      serde_json::json!(["requrv_sk_vecchia"])
+    );
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  // Un settings.json rotto non viene mai sovrascritto.
+  #[test]
+  fn claude_code_settings_refuse_to_overwrite_invalid_json() {
+    let home = claude_code_test_home();
+    let path = claude_code_settings_path_in(&home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{ non è json").unwrap();
+    let error = write_claude_code_settings_in(&home, "requrv-small-3.8", "requrv_sk_test")
+      .expect_err("deve fallire");
+    assert!(error.contains("non è un JSON valido"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ non è json");
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  // Senza backup il ripristino toglie solo le nostre chiavi env.
+  #[test]
+  fn claude_code_restore_without_backup_keeps_foreign_env() {
+    let home = claude_code_test_home();
+    let path = claude_code_settings_path_in(&home);
+    write_claude_code_settings_in(&home, "requrv-small-3.8", "requrv_sk_test").unwrap();
+    let mut settings: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    settings["env"]["FOO"] = serde_json::json!("bar");
+    write_json(&path, &settings).unwrap();
+
+    restore_claude_code_settings_in(&home).unwrap();
+    let restored: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(restored["env"]["FOO"], "bar");
+    assert!(restored["env"].get("ANTHROPIC_BASE_URL").is_none());
+    assert!(restored["env"].get("ANTHROPIC_API_KEY").is_none());
+    assert!(!claude_code_configured_in(&home));
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
   // L'app desktop non accetta --provider: CUSTOM_BASE_URL redirige il provider
   // configurato, OPENAI_BASE_URL rende OPENAI_API_KEY la chiave di quell'
   // endpoint e HERMES_INFERENCE_MODEL pinna il modello. Niente file di
@@ -2692,6 +3362,15 @@ mod tests {
     assert!(!is_hermes_bundle("ChatGPT.app"));
     assert!(!is_hermes_bundle("hermes.txt"));
     assert!(!is_hermes_bundle("OpenHermesX"));
+  }
+
+  // Il bootstrap installer ha lo stesso nome del bundle dell'agente ma un
+  // identificatore diverso: va scartato, altrimenti il lancio non fa nulla.
+  #[test]
+  fn setup_bundle_id_is_not_the_agent() {
+    assert!(is_setup_bundle_id("com.nousresearch.hermes.setup"));
+    assert!(!is_setup_bundle_id("com.nousresearch.hermes"));
+    assert!(!is_setup_bundle_id("com.nousresearch.hermes.app"));
   }
 
   #[cfg(target_os = "macos")]
@@ -2833,7 +3512,10 @@ mod tests {
     assert_eq!(entry["limit"]["output"], 32_768);
     assert_eq!(entry["modalities"]["input"], serde_json::json!(["text", "image", "video"]));
     assert_eq!(entry["modalities"]["output"], serde_json::json!(["text"]));
+    assert_eq!(entry["reasoning"], true);
     assert_eq!(entry["options"]["reasoningEffort"], "medium");
+    assert_eq!(entry["variants"]["high"]["disabled"], true);
+    assert_eq!(entry["variants"]["xhigh"]["reasoningEffort"], "xhigh");
     assert_eq!(config["model"], "requrv-hive/requrv-small-3.8");
   }
 
@@ -2864,6 +3546,23 @@ mod tests {
     assert_eq!(config["provider"]["anthropic"]["name"], "Anthropic");
     assert_eq!(config["provider"]["requrv-hive"]["options"]["apiKey"], "requrv_sk_nuova");
     assert_eq!(config["provider"]["requrv-hive"]["models"]["requrv-small-3.8"]["name"], "requrv-small-3.8");
+    assert_eq!(config["model"], "requrv-hive/requrv-small-3.8");
+  }
+
+  // Un provider in disabled_providers non viene caricato: il modello che
+  // impostiamo diventerebbe "Model not found". Togliamo il nostro id e
+  // lasciamo intatti quelli dell'utente.
+  #[test]
+  fn merge_re_enables_the_hive_provider() {
+    let mut config = serde_json::json!({
+      "disabled_providers": ["req_hive", "requrv-hive", "proxy-memory"],
+      "provider": { "anthropic": { "name": "Anthropic" } }
+    });
+    merge_hive_provider(&mut config, "requrv-small-3.8", "requrv_sk_nuova");
+    let disabled = config["disabled_providers"].as_array().expect("array");
+    assert!(!disabled.contains(&serde_json::json!("requrv-hive")));
+    assert!(disabled.contains(&serde_json::json!("req_hive")));
+    assert!(disabled.contains(&serde_json::json!("proxy-memory")));
     assert_eq!(config["model"], "requrv-hive/requrv-small-3.8");
   }
 
@@ -2914,6 +3613,72 @@ mod tests {
     let backup = dir.join("opencode.jsonc.bak");
     let backed = std::fs::read_to_string(&backup).expect("backup exists");
     assert!(backed.contains("commento"));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Il backup deve restare lo stato pre-Hive: un rilancio con un altro modello
+  // non può sovrascriverlo col file già su Hive.
+  #[test]
+  fn opencode_backup_keeps_the_pre_hive_original_across_launches() {
+    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-oc-bak-{}", std::process::id()));
+    let dir = tmp.join(".config").join("opencode");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let original = r#"{ "theme": "dark" }"#;
+    std::fs::write(dir.join("opencode.jsonc"), original).expect("write jsonc");
+
+    write_opencode_config_in(&tmp, "requrv-small-3.8", "requrv_sk_test").expect("first write");
+    write_opencode_config_in(&tmp, "requrv-medium-4", "requrv_sk_test2").expect("second write");
+
+    let backed = std::fs::read_to_string(dir.join("opencode.jsonc.bak")).expect("backup exists");
+    assert_eq!(backed, original);
+    assert!(opencode_configured_in(&tmp));
+
+    restore_opencode_config_in(&tmp).expect("restore");
+    assert_eq!(std::fs::read_to_string(dir.join("opencode.jsonc")).unwrap(), original);
+    assert!(!dir.join("opencode.jsonc.bak").exists());
+    assert!(!opencode_configured_in(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Senza backup il ripristino toglie solo ciò che è nostro: provider e modello
+  // scelti per altri provider restano intatti.
+  #[test]
+  fn opencode_restore_without_backup_keeps_foreign_providers_and_models() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-launch-test-oc-strip-{}", std::process::id()));
+    let dir = tmp.join(".config").join("opencode");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    write_opencode_config_in(&tmp, "requrv-small-3.8", "requrv_sk_test").expect("write");
+
+    let mut config: serde_json::Value = serde_json::from_str(
+      &std::fs::read_to_string(dir.join("opencode.jsonc")).expect("read back"),
+    )
+    .expect("valid json");
+    config["provider"]["anthropic"] = serde_json::json!({ "name": "Anthropic" });
+    config["model"] = serde_json::json!("anthropic/claude-sonnet-4");
+    std::fs::write(dir.join("opencode.jsonc"), config.to_string()).expect("write back");
+
+    restore_opencode_config_in(&tmp).expect("restore");
+    let restored: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.jsonc")).unwrap())
+        .expect("valid json");
+    assert!(restored["provider"].get("requrv-hive").is_none());
+    assert_eq!(restored["provider"]["anthropic"]["name"], "Anthropic");
+    assert_eq!(restored["model"], "anthropic/claude-sonnet-4");
+    assert!(!opencode_configured_in(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Un config vuoto prima della configurazione: il ripristino rimuove il file
+  // invece di lasciare una config vuota.
+  #[test]
+  fn opencode_restore_removes_the_file_when_nothing_else_is_left() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-launch-test-oc-empty-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    write_opencode_config_in(&tmp, "requrv-small-3.8", "requrv_sk_test").expect("write");
+    restore_opencode_config_in(&tmp).expect("restore");
+    assert!(!opencode_config_path_in(&tmp).exists());
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
@@ -3025,18 +3790,42 @@ mod tests {
     );
   }
 
-  // Il profilo CLI porta il catalogo (finestra di contesto, modalità,
-  // livelli di reasoning) perché il CLI non legge la config radice dell'app.
+  // Una sola tabella provider serve entrambe le superficità: l'app autentica
+  // col bearer token, il CLI con la variabile d'ambiente che il launcher passa.
   #[test]
-  fn codex_cli_profile_pins_model_provider_and_catalog() {
-    let profile = render_codex_cli_profile("requrv-small-3.8", Path::new("/home/x/.codex/hive-cli-models.json"));
-    assert!(profile.contains("model = \"requrv-small-3.8\""));
-    assert!(profile.contains("model_provider = \"hive\""));
-    assert!(profile.contains("model_catalog_json = \"/home/x/.codex/hive-cli-models.json\""));
-    assert!(profile.contains("[model_providers.hive]"));
-    assert!(profile.contains(&format!("base_url = \"{}\"", hive_openai_base_url())));
-    assert!(profile.contains("wire_api = \"responses\""));
-    assert!(profile.contains("env_key = \"HIVE_API_KEY\""));
+  fn codex_provider_carries_key_for_app_and_cli() {
+    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-codex-key-{}", std::process::id()));
+    let models = vec![HiveModel { id: "requrv-small-3.8".into(), model_type: "TEXT_GENERATION".into() }];
+    configure_chatgpt_app_in(&tmp, "requrv-small-3.8", &models, "requrv_sk_test").unwrap();
+    let table: toml::Table = std::fs::read_to_string(codex_config_path_in(&tmp))
+      .unwrap()
+      .parse()
+      .unwrap();
+    let provider = hive_provider_table(&table).expect("hive provider table");
+    assert_eq!(provider["experimental_bearer_token"].as_str(), Some("requrv_sk_test"));
+    assert_eq!(provider["env_key"].as_str(), Some("HIVE_API_KEY"));
+    assert!(chatgpt_app_configured_in(&tmp));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // I file delle versioni precedenti (profilo CLI e catalogo dedicato) non
+  // lasciano spazzatura in ~/.codex dopo il ripristino.
+  #[test]
+  fn restore_chatgpt_app_removes_legacy_cli_files() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-launch-test-codex-legacy-{}", std::process::id()));
+    let dir = tmp.join(".codex");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::write(dir.join("hive.config.toml"), "model = \"x\"\n").unwrap();
+    std::fs::write(dir.join("hive.config.bak"), "model = \"y\"\n").unwrap();
+    std::fs::write(dir.join("hive-cli-models.json"), "{}\n").unwrap();
+
+    restore_chatgpt_app_in(&tmp, "requrv_sk_test").unwrap();
+
+    assert!(!dir.join("hive.config.toml").exists());
+    assert!(!dir.join("hive.config.bak").exists());
+    assert!(!dir.join("hive-cli-models.json").exists());
+    let _ = std::fs::remove_dir_all(&tmp);
   }
 
   // model_catalog_json esiste da Codex 0.134.0: sotto, il CLI parte con un
@@ -3144,6 +3933,64 @@ mod tests {
     let value: toml::Table = std::fs::read_to_string(dir.join("config.toml")).expect("read back").parse().expect("valid toml");
     assert_eq!(value.get("model").and_then(|v| v.as_str()), Some("model-b"));
     assert_eq!(std::fs::read_to_string(dir.join("config.toml.hive.bak")).expect("original backup"), original);
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Utente senza ~/.codex: il primo configure non ha nulla da salvare, e i
+  // successivi (lancio CLI, cambio di chiave) non devono salvare come
+  // "originale" il config.toml già su Hive.
+  #[test]
+  fn configure_on_scratch_home_never_backs_up_the_hive_config() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-scratch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let dir = tmp.join(".codex");
+    let models = vec![HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() }];
+
+    configure_chatgpt_app_in(&tmp, "model-a", &models, "requrv_sk_test").expect("first configure");
+    configure_chatgpt_app_in(&tmp, "model-a", &models, "requrv_sk_other").expect("second configure");
+    let failures = reapply_persisted_configs(&tmp, "model-a", "requrv_sk_third", &[]);
+    assert!(failures.is_empty(), "{failures:?}");
+
+    assert!(!dir.join("config.toml.hive.bak").exists());
+    assert!(!dir.join("auth.json.hive.bak").exists());
+    let table: toml::Table = std::fs::read_to_string(dir.join("config.toml")).unwrap().parse().unwrap();
+    let provider = hive_provider_table(&table).expect("hive provider");
+    assert_eq!(provider["experimental_bearer_token"].as_str(), Some("requrv_sk_third"));
+
+    // Il ripristino su una config creata da noi deve azzerare tutto.
+    restore_chatgpt_app_in(&tmp, "requrv_sk_third").unwrap();
+    assert!(!dir.join("config.toml").exists());
+    assert!(!dir.join("auth.json").exists());
+    assert!(!dir.join("hive-models.json").exists());
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Un catalogo già buono non deve essere svuotato da un elenco modelli vuoto
+  // (la lista non è arrivata dal gateway): il picker resterebbe senza modelli.
+  #[test]
+  fn empty_model_list_keeps_the_existing_catalog() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-catalog-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let models = vec![
+      HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() },
+      HiveModel { id: "model-b".into(), model_type: "TEXT_GENERATION".into() },
+    ];
+    configure_chatgpt_app_in(&tmp, "model-a", &models, "requrv_sk_test").expect("configure");
+    let catalog = codex_catalog_path_in(&tmp);
+    let before = std::fs::read_to_string(&catalog).unwrap();
+
+    configure_chatgpt_app_in(&tmp, "model-b", &[], "requrv_sk_other").expect("reconfigure without models");
+
+    assert_eq!(std::fs::read_to_string(&catalog).unwrap(), before);
+    // La chiave arriva comunque: è il punto del riallineamento.
+    let table: toml::Table = std::fs::read_to_string(codex_config_path_in(&tmp)).unwrap().parse().unwrap();
+    assert_eq!(
+      hive_provider_table(&table).unwrap()["experimental_bearer_token"].as_str(),
+      Some("requrv_sk_other")
+    );
+    assert_eq!(table.get("model").and_then(|v| v.as_str()), Some("model-b"));
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
@@ -3263,17 +4110,27 @@ mod tests {
     assert!(!is_newer_version("non-a-versione", "0.1.3"));
   }
 
+  // Home isolata per i test della persistenza di ~/.claude/settings.json.
+  fn claude_code_test_home() -> PathBuf {
+    // A counter, not the clock: parallel tests in the same process can read
+    // the same timestamp and would then share (and clobber) one temp home.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-cc-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+    tmp
+  }
+
   // Claude Desktop: configure writes the managed 3p profile and flips both
   // configs to 3p; restore returns every file to its pre-Hive state.
   fn claude_test_home() -> PathBuf {
-    let tmp = std::env::temp_dir().join(format!(
-      "requrv-launch-test-claude-{}-{}",
-      std::process::id(),
-      std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-    ));
+    // Counter, not clock: parallel tests can read the same timestamp and would
+    // then share (and clobber) one temp home.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-cd-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
     let support = tmp.join("Library/Application Support");
     std::fs::create_dir_all(support.join("Claude")).unwrap();
     std::fs::create_dir_all(support.join("Claude-3p")).unwrap();
@@ -3312,7 +4169,7 @@ mod tests {
     )
     .unwrap();
     assert_eq!(profile["inferenceProvider"], "gateway");
-    assert_eq!(profile["inferenceGatewayBaseUrl"], hive_claude_gateway_base_url().as_str());
+    assert_eq!(profile["inferenceGatewayBaseUrl"], hive_anthropic_base_url().as_str());
     assert_eq!(profile["inferenceGatewayApiKey"], "requrv_sk_test");
     assert_eq!(profile["inferenceModels"][0]["name"], CLAUDE_DESKTOP_SLOT);
     assert_eq!(
