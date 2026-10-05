@@ -298,6 +298,7 @@ pub struct ServiceStatus {
   pub claude_desktop_configured: bool,
   pub opencode_configured: bool,
   pub claude_code_cli_configured: bool,
+  pub hermes_configured: bool,
 }
 
 // Reports every launch target separately so the UI can offer the app/terminal
@@ -321,6 +322,7 @@ pub fn check_services() -> ServiceStatus {
   let opencode_configured = home_dir().is_some_and(|home| opencode_configured_in(&home));
   let claude_code_cli_configured =
     home_dir().is_some_and(|home| claude_code_configured_in(&home));
+  let hermes_configured = home_dir().is_some_and(|home| hermes_configured_in(&home));
   ServiceStatus {
     opencode: opencode_app || opencode_cli,
     codex: codex_app || codex_cli,
@@ -339,6 +341,7 @@ pub fn check_services() -> ServiceStatus {
     claude_desktop_configured,
     opencode_configured,
     claude_code_cli_configured,
+    hermes_configured,
   }
 }
 
@@ -2382,27 +2385,9 @@ async fn launch_claude_cli(
   launch_cli(app, "claude", &bin, &[], &env, working_directory)
 }
 
-// Launch the Hermes Agent CLI against AI Hive. Invocation and environment are
-// built apart from the spawn so the provider contract stays testable: the
-// built-in openai-api provider reads its endpoint from OPENAI_BASE_URL and its
-// key from OPENAI_API_KEY, so nothing is written to ~/.hermes, while
-// --provider and -m pin the provider and the model for this run only.
-fn hermes_cli_args(model: &str) -> Vec<String> {
-  vec![
-    "--provider".to_string(),
-    "openai-api".to_string(),
-    "-m".to_string(),
-    model.to_string(),
-  ]
-}
-
-fn hermes_cli_env(key: &str) -> Vec<(&'static str, String)> {
-  vec![
-    ("OPENAI_BASE_URL", hive_openai_base_url()),
-    ("OPENAI_API_KEY", key.to_string()),
-  ]
-}
-
+// Launch the Hermes Agent CLI against AI Hive. It reads the same config.yaml
+// as the desktop app, so the launcher only persists the ReQurv provider and
+// the selected model and then runs `hermes` with no arguments or environment.
 async fn launch_hermes_cli(
   app: &tauri::AppHandle,
   model: &str,
@@ -2414,9 +2399,9 @@ async fn launch_hermes_cli(
 
   assert_endpoint_available(&hive_openai_base_url(), key, "/chat/completions", "Hermes").await?;
 
-  let env = hermes_cli_env(key);
-  let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-  launch_cli(app, "hermes", &bin, &hermes_cli_args(model), &env, working_directory)
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  write_hermes_config_in(&home, model, key)?;
+  launch_cli(app, "hermes", &bin, &[], &[], working_directory)
 }
 
 // ---------------------------------------------------------------------------
@@ -2486,6 +2471,32 @@ fn is_setup_bundle(bundle: &Path) -> bool {
   output.status.success() && is_setup_bundle_id(String::from_utf8_lossy(&output.stdout).trim())
 }
 
+// The Hermes checkout builds the desktop app under
+// <root>/hermes-agent/apps/desktop/release/<arch>/Hermes.app; the bundle in
+// /Applications is only the bootstrap installer (dropped by is_setup_bundle),
+// so that build output is searched as well.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn hermes_repo_app_path_in(root: &Path) -> Option<PathBuf> {
+  let release = root.join("hermes-agent").join("apps").join("desktop").join("release");
+  let mut found: Vec<PathBuf> = std::fs::read_dir(release)
+    .ok()?
+    .flatten()
+    .map(|entry| entry.path().join("Hermes.app"))
+    .filter(|bundle| bundle.is_dir())
+    .collect();
+  found.sort();
+  found.into_iter().next()
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn hermes_home_dir() -> Option<PathBuf> {
+  std::env::var("HERMES_HOME")
+    .ok()
+    .filter(|value| !value.trim().is_empty())
+    .map(PathBuf::from)
+    .or_else(|| home_dir().map(|home| home.join(".hermes")))
+}
+
 // Detected Hermes installation: the .app bundle on macOS, the binary itself
 // elsewhere. The Linux/Windows binary names vary by packaging, so the known
 // spellings are probed on PATH plus the standard install locations.
@@ -2493,6 +2504,7 @@ fn is_setup_bundle(bundle: &Path) -> bool {
 fn hermes_app_path() -> Option<PathBuf> {
   let home = home_dir()?;
   find_hermes_bundle_in(&[PathBuf::from("/Applications"), home.join("Applications")])
+    .or_else(|| hermes_home_dir().and_then(|root| hermes_repo_app_path_in(&root)))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2586,85 +2598,220 @@ fn hermes_app_running() -> bool {
   false
 }
 
-// The gateway configuration for the Hermes desktop app. Hermes resolves its
-// provider from the process environment, and the app cannot take a --provider
-// flag, so CUSTOM_BASE_URL redirects the configured custom provider while
-// OPENAI_BASE_URL makes OPENAI_API_KEY the key for that endpoint;
-// HERMES_INFERENCE_MODEL pins the model at process level.
-//
-// The CLI uses --provider openai-api instead (see hermes_cli_env): it is
-// explicit and independent of whatever provider the user configured. The app
-// has no equivalent, so these vars only take effect while ~/.hermes/config.yaml
-// resolves to the custom/openai-compatible path — a config on another provider
-// (e.g. nous) ignores them.
-fn hermes_hive_env(model: &str, key: &str) -> Vec<(&'static str, String)> {
-  let base = hive_openai_base_url();
-  vec![
-    ("CUSTOM_BASE_URL", base.clone()),
-    ("OPENAI_BASE_URL", base),
-    ("OPENAI_API_KEY", key.to_string()),
-    ("HERMES_INFERENCE_MODEL", model.to_string()),
-  ]
+// ---------------------------------------------------------------------------
+// Hermes Agent: config.yaml su AI Hive
+// ---------------------------------------------------------------------------
+// Hermes resolves its provider from ~/.hermes/config.yaml, so the launcher
+// rewrites `model` and registers a named provider instead of exporting env
+// vars: a provider named "ReQurv" is what the UI shows, and the key travels
+// inline in the provider entry (no OPENAI_*/CUSTOM_BASE_URL in the process
+// environment). The file is machine-generated with one top-level key per line,
+// so the edit is textual — a full YAML round-trip would need a new dependency
+// and would reformat the user's file.
+const HERMES_CONFIG_FILE: &str = "config.yaml";
+const HERMES_PROVIDER_KEY: &str = "requrv";
+const HERMES_PROVIDER_NAME: &str = "ReQurv";
+
+// Root of the Hermes installation/config. Mirrors what Hermes itself uses:
+// $HERMES_HOME when set, ~/.hermes otherwise.
+fn hermes_root_in(home: &Path) -> PathBuf {
+  std::env::var("HERMES_HOME")
+    .ok()
+    .filter(|value| !value.trim().is_empty())
+    .map(PathBuf::from)
+    .unwrap_or_else(|| home.join(".hermes"))
 }
 
-// Executable of the detected installation: the Mach-O inside the .app bundle
-// on macOS (CFBundleExecutable from Info.plist), the binary elsewhere.
-#[cfg(target_os = "macos")]
-fn hermes_launch_binary(install: &Path) -> Option<PathBuf> {
-  let macos_dir = install.join("Contents").join("MacOS");
-  let info_plist = install.join("Contents").join("Info.plist");
-  if let Ok(output) = Command::new("plutil")
-    .args(["-extract", "CFBundleExecutable", "raw", "-o", "-"])
-    .arg(&info_plist)
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .output()
-  {
-    if output.status.success() {
-      let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-      if !name.is_empty() {
-        let exe = macos_dir.join(&name);
-        if exe.is_file() {
-          return Some(exe);
-        }
+fn hermes_config_path_at(root: &Path) -> PathBuf {
+  root.join(HERMES_CONFIG_FILE)
+}
+
+// Every config the launcher must write: the default home plus one per named
+// profile. The desktop app launches its backend with `--profile <name>`, which
+// pins HERMES_HOME to <root>/profiles/<name>, so a provider written only to the
+// root config is invisible to the app — while the CLI, which uses the default
+// home, sees it.
+fn hermes_config_paths_at(root: &Path) -> Vec<PathBuf> {
+  let mut paths = vec![hermes_config_path_at(root)];
+  let Ok(entries) = std::fs::read_dir(root.join("profiles")) else {
+    return paths;
+  };
+  let mut profiles: Vec<PathBuf> = entries
+    .flatten()
+    .map(|entry| entry.path().join(HERMES_CONFIG_FILE))
+    .filter(|path| path.is_file())
+    .collect();
+  profiles.sort();
+  paths.extend(profiles);
+  paths
+}
+
+// Range of a top-level `key:` block: its own line plus every following indented
+// (or blank) line, stopping at the next top-level key.
+fn top_level_block(lines: &[&str], key: &str) -> Option<(usize, usize)> {
+  let needle = format!("{key}:");
+  let start = lines.iter().position(|line| line.starts_with(&needle))?;
+  let mut end = start + 1;
+  while end < lines.len() {
+    let line = lines[end];
+    if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('-') {
+      break;
+    }
+    end += 1;
+  }
+  Some((start, end))
+}
+
+// Rewrite `model` and the `providers` entry, leaving every other key untouched.
+fn merge_hermes_provider(raw: &str, model: &str, key: &str) -> String {
+  let base = hive_openai_base_url();
+  let model_block = [
+    String::from("model:"),
+    format!("  default: {model}"),
+    format!("  provider: custom:{HERMES_PROVIDER_KEY}"),
+    format!("  base_url: {base}"),
+  ];
+  let provider_block = [
+    String::from("providers:"),
+    format!("  {HERMES_PROVIDER_KEY}:"),
+    format!("    name: {HERMES_PROVIDER_NAME}"),
+    format!("    api: {base}"),
+    format!("    api_key: {key}"),
+    String::from("    models:"),
+    format!("      {model}: {{}}"),
+  ];
+
+  let original: Vec<&str> = raw.lines().collect();
+  let mut out: Vec<String> = Vec::with_capacity(original.len() + 12);
+  let mut providers_written = false;
+  let mut index = 0;
+  while index < original.len() {
+    if let Some((start, end)) = top_level_block(&original, "model") {
+      if index == start {
+        out.extend(model_block.iter().cloned());
+        index = end;
+        continue;
       }
     }
+    if let Some((start, end)) = top_level_block(&original, "providers") {
+      if index == start {
+        out.extend(provider_block.iter().cloned());
+        providers_written = true;
+        index = end;
+        continue;
+      }
+    }
+    out.push(original[index].to_string());
+    index += 1;
   }
-  // Fallback: a Tauri bundle carries a single executable in Contents/MacOS.
-  let Ok(entries) = std::fs::read_dir(&macos_dir) else {
-    return None;
+  if !providers_written {
+    out.extend(provider_block.iter().cloned());
+  }
+  let mut rendered = out.join("\n");
+  rendered.push('\n');
+  rendered
+}
+
+// True when this config already carries the provider block the launcher writes.
+fn hermes_config_has_provider(path: &Path) -> bool {
+  let Ok(raw) = std::fs::read_to_string(path) else {
+    return false;
   };
-  let mut found: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
-  found.sort();
-  found.into_iter().next()
+  let lines: Vec<&str> = raw.lines().collect();
+  let Some((start, end)) = top_level_block(&lines, "providers") else {
+    return false;
+  };
+  let base = hive_openai_base_url();
+  let block = &lines[start..end];
+  block.iter().any(|line| line.trim() == format!("{HERMES_PROVIDER_KEY}:"))
+    && block.iter().any(|line| line.trim() == format!("api: {base}"))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn hermes_launch_binary(install: &Path) -> Option<PathBuf> {
-  install.is_file().then(|| install.to_path_buf())
+// Configured only when every home (default + profiles) carries the provider.
+fn hermes_configured_at(root: &Path) -> bool {
+  hermes_config_paths_at(root).iter().all(|path| hermes_config_has_provider(path))
 }
 
-// Launch Hermes with the AI Hive environment. It is a GUI app, so the process
-// is detached: no terminal is involved (unlike the TUI CLIs).
-fn spawn_hermes_app(model: &str, key: &str) -> Result<(), String> {
+fn hermes_configured_in(home: &Path) -> bool {
+  hermes_configured_at(&hermes_root_in(home))
+}
+
+// Back up (once, only while a file is not already ours) and rewrite each config
+// with the Hive provider and the selected model.
+fn write_hermes_config_at(root: &Path, model: &str, key: &str) -> Result<(), String> {
+  for path in hermes_config_paths_at(root) {
+    let raw = std::fs::read_to_string(&path).map_err(|_| {
+      format!("Configurazione di Hermes non trovata ({}). Avvia Hermes una volta e riprova.", path.display())
+    })?;
+    if !hermes_config_has_provider(&path) {
+      let backup = backup_path_for(&path);
+      if !backup.exists() {
+        let _ = std::fs::write(&backup, raw.as_str());
+      }
+    }
+    let updated = merge_hermes_provider(&raw, model, key);
+    std::fs::write(&path, updated)
+      .map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+  }
+  Ok(())
+}
+
+fn write_hermes_config_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
+  write_hermes_config_at(&hermes_root_in(home), model, key)
+}
+
+// Back to the pre-Hive config: the one-shot backups written before the first
+// rewrite, for the default home and every profile.
+fn restore_hermes_config_at(root: &Path) -> Result<(), String> {
+  for path in hermes_config_paths_at(root) {
+    let backup = backup_path_for(&path);
+    if !backup.exists() {
+      continue;
+    }
+    std::fs::copy(&backup, &path).map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+    std::fs::remove_file(&backup).map_err(|e| e.to_string())?;
+  }
+  Ok(())
+}
+
+fn restore_hermes_config_in(home: &Path) -> Result<(), String> {
+  restore_hermes_config_at(&hermes_root_in(home))
+}
+
+// Restore the pre-Hive Hermes config and report whether a running instance must
+// be restarted to drop the ReQurv provider.
+#[tauri::command]
+pub fn restore_hermes() -> Result<AppRestartResult, String> {
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  restore_hermes_config_in(&home)?;
+  Ok(AppRestartResult {
+    restart_required: hermes_app_running(),
+  })
+}
+
+// Launch the detected installation. On macOS it goes through LaunchServices
+// (`open`): spawning the Mach-O as a child would make this launcher the
+// "responsible process" for the app's file access, so every protected folder
+// the agent touches (~/Documents, ~/Desktop) would raise a TCC prompt naming
+// the bridge instead of Hermes.
+fn spawn_hermes_app() -> Result<(), String> {
   let Some(install) = hermes_app_path() else {
     return Err(format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."));
   };
-  let Some(bin) = hermes_launch_binary(&install) else {
-    return Err(String::from("Impossibile individuare l'eseguibile di Hermes."));
-  };
-  let mut command = Command::new(&bin);
-  command.stdin(Stdio::null());
-  command.stdout(Stdio::null());
-  command.stderr(Stdio::null());
-  for (name, value) in hermes_hive_env(model, key) {
-    command.env(name, &value);
+  #[cfg(target_os = "macos")]
+  {
+    open_app_bundle(&install, "Hermes.app", &[])
   }
-  command
-    .spawn()
-    .map(|_| ())
-    .map_err(|e| format!("Impossibile avviare Hermes: {e}"))
+  #[cfg(not(target_os = "macos"))]
+  {
+    Command::new(&install)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .map(|_| ())
+      .map_err(|e| format!("Impossibile avviare Hermes: {e}"))
+  }
 }
 
 // Quit Hermes so the next launch can carry the AI Hive environment. Graceful
@@ -2754,15 +2901,17 @@ pub async fn launch_hermes_app(model: String, key: String) -> Result<AppRestartR
     return Err(format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."));
   }
   assert_endpoint_available(&hive_openai_base_url(), key, "/chat/completions", "Hermes").await?;
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  write_hermes_config_in(&home, model, key)?;
   if hermes_app_running() {
     return Ok(AppRestartResult { restart_required: true });
   }
-  spawn_hermes_app(model, key)?;
+  spawn_hermes_app()?;
   Ok(AppRestartResult { restart_required: false })
 }
 
-// Quit the running instance (if any) and relaunch it with the AI Hive
-// environment, so the new process carries the configuration.
+// Quit the running instance (if any) and relaunch it so it loads the config
+// written above.
 #[tauri::command]
 pub fn restart_hermes_app(model: String, key: String) -> Result<(), String> {
   let model = model.trim();
@@ -2776,8 +2925,10 @@ pub fn restart_hermes_app(model: String, key: String) -> Result<(), String> {
   if hermes_app_path().is_none() {
     return Err(format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."));
   }
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  write_hermes_config_in(&home, model, key)?;
   quit_hermes_app();
-  spawn_hermes_app(model, key)
+  spawn_hermes_app()
 }
 
 // Quote a value for safe inclusion in a single-quoted shell word.
@@ -3333,34 +3484,46 @@ mod tests {
     let _ = std::fs::remove_dir_all(&home);
   }
 
-  // L'app desktop non accetta --provider: CUSTOM_BASE_URL redirige il provider
-  // configurato, OPENAI_BASE_URL rende OPENAI_API_KEY la chiave di quell'
-  // endpoint e HERMES_INFERENCE_MODEL pinna il modello. Niente file di
-  // configurazione, quindi niente restore.
+  // La configurazione di Hermes vive in config.yaml: provider "ReQurv" con la
+  // chiave inline e il modello scelto, senza variabili d'ambiente. Va scritta
+  // sia nella home di default sia in ogni profilo: l'app desktop lancia il
+  // backend con --profile, che sposta HERMES_HOME.
   #[test]
-  fn builds_hermes_desktop_env() {
-    let env = hermes_hive_env("model-a", "requrv_sk_test");
-    let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("CUSTOM_BASE_URL"), Some(&hive_openai_base_url()));
-    assert_eq!(map.get("OPENAI_BASE_URL"), Some(&hive_openai_base_url()));
-    assert_eq!(map.get("OPENAI_API_KEY"), Some(&"requrv_sk_test".to_string()));
-    assert_eq!(map.get("HERMES_INFERENCE_MODEL"), Some(&"model-a".to_string()));
-    assert_eq!(map.len(), 4);
-  }
+  fn writes_hermes_provider_into_every_home() {
+    let root = std::env::temp_dir().join(format!("requrv-launch-test-hermes-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let profile_dir = root.join("profiles").join("developer");
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let original = "model:\n  default: gpt-6.1-sol\n  provider: custom\n  base_url: http://localhost:8086/v1\ndatabase:\n  journal_mode: wal\ncustom_providers: []\n";
+    let root_path = hermes_config_path_at(&root);
+    let profile_path = hermes_config_path_at(&profile_dir);
+    std::fs::write(&root_path, original).unwrap();
+    std::fs::write(&profile_path, original).unwrap();
+    assert_eq!(hermes_config_paths_at(&root).len(), 2);
 
-  // The Hermes CLI is pointed at AI Hive through the built-in openai-api
-  // provider: endpoint and key travel in the environment (nothing is written
-  // to ~/.hermes) and the provider/model are pinned per invocation.
-  #[test]
-  fn builds_hermes_cli_invocation() {
-    let args = hermes_cli_args("requrv-small-3.8");
-    assert_eq!(args.join(" "), "--provider openai-api -m requrv-small-3.8");
+    write_hermes_config_at(&root, "requrv-small-3.8", "requrv_sk_test").unwrap();
+    for path in [&root_path, &profile_path] {
+      let written = std::fs::read_to_string(path).unwrap();
+      assert!(written.contains("  provider: custom:requrv\n"), "{path:?}");
+      assert!(written.contains("  default: requrv-small-3.8\n"), "{path:?}");
+      assert!(written.contains(&format!("  base_url: {}\n", hive_openai_base_url())), "{path:?}");
+      assert!(written.contains("providers:\n  requrv:\n    name: ReQurv\n"), "{path:?}");
+      assert!(written.contains("    api_key: requrv_sk_test\n"), "{path:?}");
+      assert!(written.contains("      requrv-small-3.8: {}\n"), "{path:?}");
+      // Il resto del file resta intatto.
+      assert!(written.contains("database:\n  journal_mode: wal\n"), "{path:?}");
+      assert!(written.contains("custom_providers: []\n"), "{path:?}");
+    }
+    assert!(hermes_configured_at(&root));
 
-    let env = hermes_cli_env("requrv_sk_test");
-    let map: std::collections::HashMap<&str, String> = env.into_iter().collect();
-    assert_eq!(map.get("OPENAI_BASE_URL"), Some(&hive_openai_base_url()));
-    assert_eq!(map.get("OPENAI_API_KEY"), Some(&"requrv_sk_test".to_string()));
-    assert_eq!(map.len(), 2);
+    // Il ripristino torna all'originale su ogni home e rimuove i backup.
+    restore_hermes_config_at(&root).unwrap();
+    for path in [&root_path, &profile_path] {
+      assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+      assert!(!backup_path_for(path).exists());
+    }
+    assert!(!hermes_configured_at(&root));
+    let _ = std::fs::remove_dir_all(&root);
   }
 
   #[test]
@@ -3410,6 +3573,24 @@ mod tests {
     assert_eq!(find_hermes_bundle_in(&[tmp.clone()]), Some(bundle));
     let empty = tmp.join("vuoto");
     assert_eq!(find_hermes_bundle_in(&[empty]), None);
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // L'app desktop del checkout Hermes vive sotto apps/desktop/release/<arch>/,
+  // non in /Applications: va trovata lì.
+  #[test]
+  fn finds_hermes_app_in_the_checkout_release_dir() {
+    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-hermes-repo-{}", std::process::id()));
+    let bundle = tmp
+      .join("hermes-agent")
+      .join("apps")
+      .join("desktop")
+      .join("release")
+      .join("mac-arm64")
+      .join("Hermes.app");
+    std::fs::create_dir_all(&bundle).expect("create fake bundle");
+    assert_eq!(hermes_repo_app_path_in(&tmp), Some(bundle));
+    assert_eq!(hermes_repo_app_path_in(&tmp.join("vuoto")), None);
     let _ = std::fs::remove_dir_all(&tmp);
   }
 

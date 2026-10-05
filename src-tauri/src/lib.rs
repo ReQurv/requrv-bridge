@@ -34,6 +34,7 @@ pub fn run() {
       commands::restore_chatgpt_app,
       commands::launch_hermes_app,
       commands::restart_hermes_app,
+      commands::restore_hermes,
       commands::configure_claude_desktop,
       commands::restart_claude_desktop,
       commands::restart_claude_desktop_restored,

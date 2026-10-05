@@ -18,6 +18,7 @@ export interface ServiceStatus {
   claude_code_cli: boolean
   hermes_app: boolean
   hermes_cli: boolean
+  hermes_configured: boolean
   claude_desktop: boolean
   claude_desktop_app: boolean
   claude_desktop_configured: boolean
@@ -198,7 +199,11 @@ export function surfaceState(st: ServiceStatus | null, surface: ServiceSurface):
     return { installed: st.claude_code_cli, configured: st.claude_code_cli_configured }
   }
   if (surface.service === 'hermes') {
-    return { installed: surface.kind === 'desktop' ? st.hermes_app : st.hermes_cli, configured: false }
+    // App and CLI read the same ~/.hermes/config.yaml.
+    return {
+      installed: surface.kind === 'desktop' ? st.hermes_app : st.hermes_cli,
+      configured: st.hermes_configured
+    }
   }
   if (surface.service === 'opencode') {
     return {
@@ -561,7 +566,7 @@ export function useHive() {
     claude_desktop: 'restore_claude_desktop',
     opencode: 'restore_opencode',
     claude_code: 'restore_claude_code_cli',
-    hermes: ''
+    hermes: 'restore_hermes'
   }
 
   async function restoreApp(service: ServiceId) {
