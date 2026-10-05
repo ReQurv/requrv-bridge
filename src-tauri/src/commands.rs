@@ -2162,7 +2162,7 @@ async fn launch_codex_cli(
   // editor-managed codex runtime), and codex would then read a config this
   // launcher never wrote. The provider itself authenticates with the bearer
   // token in config.toml, so no key env is needed.
-  let codex_home = codex_dir_in(&home);
+  let codex_home = hive_codex_home().ok_or_else(|| "Home directory non trovata".to_string())?;
   let codex_home = codex_home.to_string_lossy();
   launch_cli(app, "codex", &bin, &[], &[("CODEX_HOME", codex_home.as_ref())], working_directory)
 }
@@ -2488,15 +2488,6 @@ fn hermes_repo_app_path_in(root: &Path) -> Option<PathBuf> {
   found.into_iter().next()
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn hermes_home_dir() -> Option<PathBuf> {
-  std::env::var("HERMES_HOME")
-    .ok()
-    .filter(|value| !value.trim().is_empty())
-    .map(PathBuf::from)
-    .or_else(|| home_dir().map(|home| home.join(".hermes")))
-}
-
 // Detected Hermes installation: the .app bundle on macOS, the binary itself
 // elsewhere. The Linux/Windows binary names vary by packaging, so the known
 // spellings are probed on PATH plus the standard install locations.
@@ -2504,7 +2495,7 @@ fn hermes_home_dir() -> Option<PathBuf> {
 fn hermes_app_path() -> Option<PathBuf> {
   let home = home_dir()?;
   find_hermes_bundle_in(&[PathBuf::from("/Applications"), home.join("Applications")])
-    .or_else(|| hermes_home_dir().and_then(|root| hermes_repo_app_path_in(&root)))
+    .or_else(|| hermes_repo_app_path_in(&hermes_root_in(&home)))
 }
 
 #[cfg(not(target_os = "macos"))]
