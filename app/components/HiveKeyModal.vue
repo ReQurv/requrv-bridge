@@ -46,10 +46,18 @@ async function onSave() {
           autocomplete="off"
           spellcheck="false"
           class="font-mono"
-          :trailing-icon="showKey ? 'i-lucide-eye-off' : 'i-lucide-eye'"
-          :trailing-icon-click="true"
-          @trailing-click="showKey = !showKey"
-        />
+        >
+          <template #trailing>
+            <UButton
+              :icon="showKey ? 'i-lucide-eye-off' : 'i-lucide-eye'"
+              variant="ghost"
+              size="sm"
+              color="neutral"
+              :aria-label="showKey ? 'Nascondi chiave' : 'Mostra chiave'"
+              @click="showKey = !showKey"
+            />
+          </template>
+        </UInput>
 
         <p
           v-if="keySaved && models.length === 0"

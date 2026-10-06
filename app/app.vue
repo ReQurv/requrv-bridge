@@ -14,7 +14,7 @@ useHead({
   }
 })
 
-const title = 'ReQurv Launch'
+const title = 'ReQurv Bridge'
 const description = 'Lancia i tuoi agenti AI già configurati per AI Hive, l\'AI Gateway di ReQurv.'
 
 useSeoMeta({
@@ -45,76 +45,62 @@ onMounted(async () => {
 <template>
   <UApp>
     <div class="flex min-h-svh flex-col">
-      <UHeader>
-        <template #left>
+      <header class="border-b border-default bg-default">
+        <div class="mx-auto flex w-full max-w-6xl flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <div class="flex min-w-0 items-center gap-3">
             <NuxtLink
               to="/"
               class="focus-visible:outline-3 outline-primary/25 rounded-md p-1 -ms-1"
+              aria-label="ReQurv Bridge"
             >
-              <AppLogo class="w-auto h-10 shrink-0" />
+              <!-- Logo trasparente: in light mode il chip nero mantiene la leggibilità del testo bianco -->
+              <img
+                src="/logo_requrv_bridge.png"
+                alt="ReQurv Bridge"
+                class="w-auto h-8 rounded-md bg-black sm:h-10 dark:bg-transparent"
+              >
             </NuxtLink>
 
             <div class="min-w-0">
-              <h1 class="text-sm font-semibold leading-tight">
-                ReQurv Launch
-              </h1>
               <p class="hidden truncate text-xs leading-tight text-muted md:block">
                 Lancia i tuoi agenti AI già configurati per AI Hive, l'AI Gateway di ReQurv.
               </p>
             </div>
+            <UButton
+              label="AI Hive"
+              icon="i-lucide-external-link"
+              color="neutral"
+              variant="ghost"
+              size="sm"
+              class="ms-2 hidden md:inline-flex"
+              @click="hive.openExternal('https://hive.requrv.ai')"
+            />
           </div>
 
-          <UButton
-            label="AI Hive"
-            icon="i-lucide-external-link"
-            color="neutral"
-            variant="ghost"
-            size="sm"
-            class="ms-2 hidden md:inline-flex"
-            @click="hive.openExternal('https://hive.requrv.ai')"
-          />
-        </template>
-
-        <template #right>
-          <USelect
-            v-if="chatModelIds.length > 0"
-            v-model="selectedModel"
-            :items="chatModelIds"
-            size="sm"
-            aria-label="Modello di default"
-            class="mr-2 w-44 lg:w-56"
-          />
-          <UButton
-            :label="keySaved ? 'Chiave AI Hive' : 'Configura chiave'"
-            icon="i-lucide-key-round"
-            :trailing-icon="keySaved ? 'i-lucide-check' : undefined"
-            :color="keySaved ? 'success' : 'warning'"
-            :variant="keySaved ? 'subtle' : 'solid'"
-            size="sm"
-            class="mr-2"
-            @click="keyModalOpen = true"
-          />
-          <UColorModeButton />
-        </template>
-
-        <template #bottom>
-          <UContainer class="flex flex-wrap items-center justify-between gap-3 mt-2">
-            <p class="text-xs text-dimmed">
-              Hai appena installato un servizio? Esegui una nuova rilevazione.
-            </p>
-            <UButton
-              icon="i-lucide-refresh-cw"
-              label="Rileva di nuovo"
-              color="neutral"
-              variant="subtle"
+          <div class="flex w-full items-center gap-2 sm:w-auto sm:gap-1.5">
+            <USelect
+              v-if="chatModelIds.length > 0"
+              v-model="selectedModel"
+              :items="chatModelIds"
               size="sm"
-              :loading="refreshing"
-              @click="hive.refreshStatus()"
+              aria-label="Modello di default"
+              class="min-w-0 flex-1 sm:w-40 sm:flex-none lg:w-56"
             />
-          </UContainer>
-        </template>
-      </UHeader>
+            <UButton
+              :label="keySaved ? 'Chiave AI Hive' : 'Configura chiave'"
+              icon="i-lucide-key-round"
+              :trailing-icon="keySaved ? 'i-lucide-check' : undefined"
+              :color="keySaved ? 'success' : 'warning'"
+              :variant="keySaved ? 'subtle' : 'solid'"
+              size="sm"
+              :ui="{ label: 'hidden sm:inline' }"
+              :aria-label="keySaved ? 'Chiave AI Hive' : 'Configura chiave'"
+              @click="keyModalOpen = true"
+            />
+            <UColorModeButton />
+          </div>
+        </div>
+      </header>
 
       <UContainer
         v-if="updateInfo?.update_available && !updateDismissed"
@@ -126,7 +112,7 @@ onMounted(async () => {
           icon="i-lucide-arrow-up-circle"
           orientation="horizontal"
           title="Nuova versione disponibile"
-          :description="`Scarica e avvia l'ultima release (v${updateInfo.latest_version}) per aggiornare ReQurv Launch.`"
+          :description="`Scarica e avvia l'ultima release (v${updateInfo.latest_version}) per aggiornare ReQurv Bridge.`"
           :actions="[
             {
               label: 'Scarica',
@@ -148,10 +134,16 @@ onMounted(async () => {
 
       <USeparator icon="i-lucide-hexagon" />
 
-      <UFooter>
+      <UFooter
+        :ui="{
+          container: 'flex items-center justify-between gap-x-3 py-3 lg:py-4',
+          left: 'order-1 flex min-w-0 items-center gap-x-1.5',
+          right: 'order-3 flex shrink-0 items-center justify-end gap-x-1.5'
+        }"
+      >
         <template #left>
-          <p class="text-sm text-muted">
-            ReQurv Launch © {{ new Date().getFullYear() }} — powered by
+          <p class="truncate text-xs text-muted sm:text-sm">
+            ReQurv Bridge © {{ new Date().getFullYear() }} — powered by
             <button
               type="button"
               class="cursor-pointer text-primary hover:underline"
@@ -174,7 +166,6 @@ onMounted(async () => {
     </div>
 
     <HiveKeyModal />
-    <LaunchModal />
     <RestartModal />
   </UApp>
 </template>

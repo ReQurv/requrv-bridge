@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a bug in ReQurv Launch
+description: Report a bug in ReQurv Bridge
 labels: [bug]
 body:
   - type: markdown
