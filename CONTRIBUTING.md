@@ -88,6 +88,7 @@ Rules that apply to every strategy:
 - **Probe before launching**: verify the gateway exposes the endpoint the agent needs (`/responses`, `/messages`) and fail with a clear Italian error if it does not.
 - **Never store the key in the agent's config in a shared location** unless the pattern requires it (see ChatGPT.app: the key goes in `experimental_bearer_token` / `auth.json`, which is how that app consumes it).
 - **macOS TTY**: TUI agents must be launched through the system terminal (a generated shell script opened in Terminal.app) so they get a real TTY. Reuse the existing launch helpers in `commands.rs`.
+- **Desktop-app lifecycle is per-OS**: if the connector has a desktop surface, implement detect / running / quit / launch under `#[cfg]` for each OS — macOS drives the `.app` bundle via LaunchServices, Windows spawns the `.exe` and probes/quits via `tasklist`/`taskkill`, Linux spawns the binary and probes/quits via `pgrep`/`pkill`. Reuse the shared helpers in `commands.rs` (`desktop_spawn_app`, `desktop_process_running`, `desktop_process_quit`, `desktop_app_from_desktop_entry`, `application_support_root`) and derive the process name from the detected binary's file name so the running-probe and the quit stay in lockstep. If the vendor ships no desktop build for an OS, mark the surface with a `platforms` list in `SERVICE_GROUPS` (`useHive.ts`) so the frontend (`isSurfaceAvailable`) hides that row there.
 
 ### 2. Rust backend (`src-tauri/src/commands.rs`)
 

@@ -13,7 +13,7 @@ const hive = useHive()
 const { keySaved, selectedModel, status, launching, restoring, projectDirectory } = hive
 
 const rows = computed(() =>
-  props.group.surfaces.map(surface => ({
+  props.group.surfaces.filter(isSurfaceAvailable).map(surface => ({
     surface,
     key: surfaceKey(surface),
     ...surfaceState(status.value, surface),

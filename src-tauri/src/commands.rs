@@ -540,6 +540,29 @@ fn home_dir() -> Option<PathBuf> {
     .map(PathBuf::from)
 }
 
+// Per-OS root where a desktop app keeps its user config/data: "Application
+// Support" on macOS, %APPDATA% on Windows, $XDG_CONFIG_HOME (else ~/.config)
+// on Linux. Only the current platform's branch compiles.
+fn application_support_root(home: &Path) -> PathBuf {
+  #[cfg(target_os = "macos")]
+  {
+    home.join("Library").join("Application Support")
+  }
+  #[cfg(windows)]
+  {
+    std::env::var("APPDATA")
+      .map(PathBuf::from)
+      .unwrap_or_else(|_| home.join("AppData").join("Roaming"))
+  }
+  #[cfg(target_os = "linux")]
+  {
+    std::env::var("XDG_CONFIG_HOME")
+      .map(PathBuf::from)
+      .filter(|p| p.is_absolute())
+      .unwrap_or_else(|| home.join(".config"))
+  }
+}
+
 // Directory of the active npm global prefix (covers nvm/nvm4w layouts where
 // `npm i -g` shims live outside the default %APPDATA%\npm).
 fn npm_global_dir() -> Option<PathBuf> {
@@ -676,6 +699,164 @@ fn app_bundle_path_in(candidates: &[PathBuf]) -> Option<PathBuf> {
   candidates.iter().find(|path| path.is_dir()).cloned()
 }
 
+// ---------------------------------------------------------------------------
+// Desktop-app lifecycle helpers for Windows and Linux
+// ---------------------------------------------------------------------------
+// On macOS every desktop app goes through LaunchServices (`open`) plus
+// osascript/pkill, so the per-app code there stays platform-specific. On the
+// other platforms the desktop app is a plain executable, so these shared
+// helpers give each harness the same launch/running/quit plumbing without
+// repeating the tasklist/pgrep details. Each helper is compiled only on its
+// own platform; macOS never sees them.
+
+// Launch a desktop app executable detached. The cross-platform sibling of
+// `open_app_bundle` (macOS): stdio is nulled so the child outlives this call.
+// No CREATE_NEW_CONSOLE here, unlike `spawn_cli`, because these are GUI
+// (windows-subsystem) apps that own their window rather than a console.
+#[cfg(any(windows, target_os = "linux"))]
+fn desktop_spawn_app(bin: &Path, env: &[(&str, &str)], label: &str) -> Result<(), String> {
+  let mut command = Command::new(bin);
+  for (name, value) in env {
+    command.env(name, value);
+  }
+  command
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map(|_| ())
+    .map_err(|e| format!("Impossibile avviare {label}: {e}"))
+}
+
+// True when any of the given process image names is live. Callers pass
+// platform-appropriate names (`.exe` on Windows, bare on Linux).
+#[cfg(windows)]
+fn desktop_process_running(names: &[&str]) -> bool {
+  for name in names {
+    let Ok(output) = Command::new("tasklist")
+      .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::null)
+      .output()
+    else {
+      continue;
+    };
+    if String::from_utf8_lossy(&output.stdout)
+      .to_lowercase()
+      .contains(&name.to_lowercase())
+    {
+      return true;
+    }
+  }
+  false
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_process_running(names: &[&str]) -> bool {
+  for name in names {
+    let running = Command::new("pgrep")
+      .arg("-x")
+      .arg(name)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null)
+      .status()
+      .is_ok_and(|s| s.success());
+    if running {
+      return true;
+    }
+  }
+  false
+}
+
+// Force-terminate the given process image names. Best effort: a missing or
+// already-exited process is not an error (same contract as the macOS quit).
+#[cfg(windows)]
+fn desktop_process_quit(names: &[&str]) {
+  for name in names {
+    Command::new("taskkill")
+      .args(["/F", "/IM", name])
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null)
+      .spawn()
+      .ok();
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_process_quit(names: &[&str]) {
+  for name in names {
+    Command::new("pkill")
+      .arg("-x")
+      .arg(name)
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null)
+      .spawn()
+      .ok();
+  }
+}
+
+// Extract the launcher binary from a freedesktop `Exec=` value: the first
+// whitespace-separated token, minus any leading `path=` prefix. Kept pure (no
+// fs) so the parsing is testable on every host; the caller verifies the
+// result is a real file.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_entry_target(exec_value: &str) -> Option<String> {
+  let token = exec_value.split_whitespace().next()?;
+  let token = token.strip_prefix("path=").unwrap_or(token);
+  if token.is_empty() {
+    None
+  } else {
+    Some(token.to_string())
+  }
+}
+
+// Resolve a GUI app from its freedesktop `.desktop` entry. Linux packages do
+// not share an install convention (no %LOCALAPPDATA%\Programs equivalent), so
+// guessing binary names is unreliable; the `.desktop` file the .deb/.rpm ships
+// carries the real Exec path the vendor chose. `matcher` is a case-insensitive
+// substring of the entry file name (e.g. "opencode", "claude").
+#[cfg(target_os = "linux")]
+fn desktop_app_from_desktop_entry(matcher: &str) -> Option<PathBuf> {
+  let mut dirs = vec![PathBuf::from("/usr/share/applications")];
+  if let Some(home) = home_dir() {
+    dirs.push(home.join(".local").join("share").join("applications"));
+  }
+  let matcher = matcher.to_lowercase();
+  for dir in dirs {
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+      continue;
+    };
+    for entry in entries.flatten() {
+      let file_name = entry.file_name();
+      let name = file_name.to_string_lossy();
+      if !name.ends_with(".desktop") || !name.to_lowercase().contains(&matcher) {
+        continue;
+      }
+      let Ok(content) = std::fs::read_to_string(entry.path()) else {
+        continue;
+      };
+      for line in content.lines() {
+        let Some(value) = line.trim().strip_prefix("Exec=") else {
+          continue;
+        };
+        // Exec is "binary [args]" — the launcher is the first token.
+        let Some(binary) = desktop_entry_target(value) else {
+          continue;
+        };
+        let path = PathBuf::from(&binary);
+        if path.is_file() {
+          return Some(path);
+        }
+      }
+    }
+  }
+  None
+}
+
 #[cfg(target_os = "macos")]
 fn opencode_app_path() -> Option<PathBuf> {
   let home = home_dir()?;
@@ -685,9 +866,48 @@ fn opencode_app_path() -> Option<PathBuf> {
   ])
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn opencode_app_path() -> Option<PathBuf> {
-  None
+  // NSIS installers lay the Electron app under %LOCALAPPDATA%\Programs; a
+  // system-wide install may land in one of the Program Files roots.
+  let mut roots: Vec<PathBuf> = Vec::new();
+  if let Ok(local) = std::env::var("LOCALAPPDATA") {
+    roots.push(Path::new(&local).join("Programs"));
+  }
+  for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+    if let Ok(dir) = std::env::var(var) {
+      roots.push(PathBuf::from(dir));
+    }
+  }
+  let mut candidates: Vec<PathBuf> = Vec::new();
+  for root in roots {
+    for dir in ["OpenCode", "opencode", "OpenCode Desktop"] {
+      for exe in ["OpenCode.exe", "opencode-desktop.exe", "OpenCode Desktop.exe"] {
+        candidates.push(root.join(dir).join(exe));
+      }
+    }
+  }
+  candidates.into_iter().find(|c| c.is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn opencode_app_path() -> Option<PathBuf> {
+  // Prefer the .deb/.rpm's own .desktop entry, which names the real binary.
+  // The bare `opencode` on PATH is the CLI (installed via curl|bash / npm), so
+  // it is deliberately not a candidate: this is the *desktop* app.
+  desktop_app_from_desktop_entry("opencode").or_else(|| {
+    let mut candidates = vec![
+      PathBuf::from("/usr/bin/opencode-desktop"),
+      PathBuf::from("/usr/bin/OpenCode"),
+      PathBuf::from("/usr/local/bin/opencode-desktop"),
+      PathBuf::from("/opt/opencode-desktop/opencode-desktop"),
+      PathBuf::from("/opt/opencode/OpenCode"),
+    ];
+    if let Some(home) = home_dir() {
+      candidates.push(home.join(".local").join("bin").join("opencode-desktop"));
+    }
+    candidates.into_iter().find(|c| c.is_file())
+  })
 }
 
 // The ChatGPT desktop app (macOS) is what users install as "Codex"; it also
@@ -701,8 +921,46 @@ fn chatgpt_app_bundle() -> Option<PathBuf> {
   ])
 }
 
-#[cfg(not(target_os = "macos"))]
+// On Windows the ChatGPT app ships as a Microsoft Store (MSIX) package, so it
+// has no fixed install path: locate the per-user package that matches "chatgpt"
+// and find its launcher exe. The exact package family and exe sub-path are
+// device-dependent — the candidates here cover the common MSIX layouts and
+// must be confirmed on a real Store install.
+#[cfg(windows)]
 fn chatgpt_app_bundle() -> Option<PathBuf> {
+  let Ok(local) = std::env::var("LOCALAPPDATA") else {
+    return None;
+  };
+  let packages = Path::new(&local).join("Packages");
+  let Ok(entries) = std::fs::read_dir(&packages) else {
+    return None;
+  };
+  for entry in entries.flatten() {
+    let family = entry.file_name().to_string_lossy();
+    if !family.to_lowercase().contains("chatgpt") {
+      continue;
+    }
+    let base = entry.path();
+    for sub in ["", "Main", "ChatGPT", "app"] {
+      for exe in ["ChatGPT.exe", "app.exe"] {
+        let candidate = if sub.is_empty() {
+          base.join(exe)
+        } else {
+          base.join(sub).join(exe)
+        };
+        if candidate.is_file() {
+          return Some(candidate);
+        }
+      }
+    }
+  }
+  None
+}
+
+#[cfg(target_os = "linux")]
+fn chatgpt_app_bundle() -> Option<PathBuf> {
+  // There is no Linux build of the ChatGPT desktop app; the Codex CLI is the
+  // supported Codex surface there and shares this config.
   None
 }
 
@@ -1170,16 +1428,24 @@ fn opencode_app_running() -> bool {
     .is_ok_and(|s| s.success())
 }
 
+// On Windows/Linux the app is a plain executable, so the process name is the
+// detected binary's file name — deriving it here keeps the probe and the quit
+// (which uses the same) in lockstep with whatever the installer named it.
 #[cfg(not(target_os = "macos"))]
 fn opencode_app_running() -> bool {
-  false
+  let Some(bin) = opencode_app_path() else {
+    return false;
+  };
+  let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
+    return false;
+  };
+  desktop_process_running(&[name])
 }
 
 // Point the OpenCode desktop app at AI Hive: write the global config and report
 // whether a running instance must be restarted, because the app reads that
 // config only at startup.
 #[tauri::command]
-#[cfg(target_os = "macos")]
 pub fn configure_opencode_app(model: String, key: String) -> Result<AppRestartResult, String> {
   let model = model.trim();
   let key = key.trim();
@@ -1190,18 +1456,16 @@ pub fn configure_opencode_app(model: String, key: String) -> Result<AppRestartRe
     return Err("Chiave Hive non salvata".into());
   }
   if opencode_app_path().is_none() {
-    return Err(String::from("OpenCode.app non trovato in /Applications: installalo e riprova."));
+    #[cfg(target_os = "macos")]
+    let not_found = "OpenCode.app non trovato in /Applications: installalo e riprova.";
+    #[cfg(not(target_os = "macos"))]
+    let not_found = "OpenCode Desktop non trovato: installalo e riprova.";
+    return Err(String::from(not_found));
   }
   write_opencode_config(model, key)?;
   Ok(AppRestartResult {
     restart_required: opencode_app_running(),
   })
-}
-
-#[tauri::command]
-#[cfg(not(target_os = "macos"))]
-pub fn configure_opencode_app(_model: String, _key: String) -> Result<AppRestartResult, String> {
-  Err(String::from("L'app OpenCode è disponibile solo su macOS."))
 }
 
 #[tauri::command]
@@ -1215,7 +1479,9 @@ pub fn open_opencode_app() -> Result<(), String> {
 #[tauri::command]
 #[cfg(not(target_os = "macos"))]
 pub fn open_opencode_app() -> Result<(), String> {
-  Err(String::from("L'app OpenCode è disponibile solo su macOS."))
+  let bin = opencode_app_path()
+    .ok_or_else(|| String::from("OpenCode Desktop non trovato: installalo e riprova."))?;
+  desktop_spawn_app(&bin, &[], "OpenCode Desktop")
 }
 
 // Quit the running instance (if any) and relaunch it so it loads the config
@@ -1242,6 +1508,27 @@ fn quit_and_reopen_opencode() -> Result<(), String> {
   open_app_bundle(&bundle, "OpenCode.app", &[])
 }
 
+#[cfg(not(target_os = "macos"))]
+fn quit_and_reopen_opencode() -> Result<(), String> {
+  let bin = opencode_app_path()
+    .ok_or_else(|| String::from("OpenCode Desktop non trovato: installalo e riprova."))?;
+  let name = bin
+    .file_name()
+    .and_then(|n| n.to_str())
+    .map(str::to_owned)
+    .ok_or_else(|| String::from("OpenCode Desktop non trovato: installalo e riprova."))?;
+  if opencode_app_running() {
+    desktop_process_quit(&[name.as_str()]);
+    for _ in 0..10 {
+      if !opencode_app_running() {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+  }
+  desktop_spawn_app(&bin, &[], "OpenCode Desktop")
+}
+
 #[tauri::command]
 #[cfg(target_os = "macos")]
 pub fn restart_opencode_app() -> Result<(), String> {
@@ -1251,7 +1538,7 @@ pub fn restart_opencode_app() -> Result<(), String> {
 #[tauri::command]
 #[cfg(not(target_os = "macos"))]
 pub fn restart_opencode_app() -> Result<(), String> {
-  Err(String::from("L'app OpenCode è disponibile solo su macOS."))
+  quit_and_reopen_opencode()
 }
 
 fn launch_opencode_cli(
@@ -1279,9 +1566,23 @@ pub fn open_chatgpt_app() -> Result<(), String> {
 }
 
 #[tauri::command]
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 pub fn open_chatgpt_app() -> Result<(), String> {
-  Err(String::from("L'app ChatGPT è disponibile solo su macOS."))
+  let bin = chatgpt_app_bundle().ok_or_else(|| {
+    String::from("L'app ChatGPT non è stata trovata: installala dal Microsoft Store e riprova.")
+  })?;
+  let codex_home = hive_codex_home().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let codex_home = codex_home.to_string_lossy();
+  // CODEX_HOME points at %USERPROFILE%\.codex, which is also codex's own
+  // default there, so the config lands correctly even if a Store launch drops
+  // the forwarded variable.
+  desktop_spawn_app(&bin, &[("CODEX_HOME", codex_home.as_ref())], "ChatGPT")
+}
+
+#[tauri::command]
+#[cfg(target_os = "linux")]
+pub fn open_chatgpt_app() -> Result<(), String> {
+  Err(String::from("L'app ChatGPT non è disponibile su Linux."))
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,7 +1975,18 @@ fn chatgpt_app_running() -> bool {
     .is_ok_and(|s| s.success())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn chatgpt_app_running() -> bool {
+  let Some(bin) = chatgpt_app_bundle() else {
+    return false;
+  };
+  let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
+    return false;
+  };
+  desktop_process_running(&[name])
+}
+
+#[cfg(target_os = "linux")]
 fn chatgpt_app_running() -> bool {
   false
 }
@@ -1723,9 +2035,33 @@ fn quit_and_reopen_chatgpt() -> Result<(), String> {
   open_app_bundle(&bundle, "ChatGPT.app", &[("CODEX_HOME", codex_home.as_ref())])
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 fn quit_and_reopen_chatgpt() -> Result<(), String> {
-  Err(String::from("L'app ChatGPT è disponibile solo su macOS."))
+  let bin = chatgpt_app_bundle().ok_or_else(|| {
+    String::from("L'app ChatGPT non è stata trovata: installala dal Microsoft Store e riprova.")
+  })?;
+  let name = bin
+    .file_name()
+    .and_then(|n| n.to_str())
+    .map(str::to_owned)
+    .ok_or_else(|| String::from("L'app ChatGPT non è stata trovata."))?;
+  if chatgpt_app_running() {
+    desktop_process_quit(&[name.as_str()]);
+    for _ in 0..10 {
+      if !chatgpt_app_running() {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+  }
+  let codex_home = hive_codex_home().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let codex_home = codex_home.to_string_lossy();
+  desktop_spawn_app(&bin, &[("CODEX_HOME", codex_home.as_ref())], "ChatGPT")
+}
+
+#[cfg(target_os = "linux")]
+fn quit_and_reopen_chatgpt() -> Result<(), String> {
+  Err(String::from("L'app ChatGPT non è disponibile su Linux."))
 }
 
 #[derive(Serialize)]
@@ -1791,11 +2127,43 @@ const CLAUDE_DESKTOP_SLOT: &str = "claude-sonnet-5";
 const CLAUDE_DESKTOP_BACKUP: &str = "hive.bak";
 
 fn claude_desktop_app_path() -> Option<PathBuf> {
-  let candidates = [
-    PathBuf::from("/Applications/Claude.app"),
-    home_dir()?.join("Applications/Claude.app"),
-  ];
-  candidates.into_iter().find(|p| p.is_dir())
+  #[cfg(target_os = "macos")]
+  {
+    let candidates = [
+      PathBuf::from("/Applications/Claude.app"),
+      home_dir()?.join("Applications/Claude.app"),
+    ];
+    candidates.into_iter().find(|p| p.is_dir())
+  }
+  // Windows: the NSIS installer puts the Electron app under
+  // %LOCALAPPDATA%\Program\Claude (or a Program Files root for system installs).
+  #[cfg(windows)]
+  {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+      roots.push(Path::new(&local).join("Program").join("Claude"));
+    }
+    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+      if let Ok(dir) = std::env::var(var) {
+        roots.push(PathBuf::from(dir).join("Claude"));
+      }
+    }
+    let candidates = roots.into_iter().map(|root| root.join("Claude.exe")).collect::<Vec<_>>();
+    candidates.into_iter().find(|c| c.is_file())
+  }
+  // Linux: prefer the .deb/.rpm's .desktop entry (it names the real binary);
+  // the bare `claude` on PATH is the CLI, so it is not a candidate here.
+  #[cfg(target_os = "linux")]
+  {
+    desktop_app_from_desktop_entry("claude").or_else(|| {
+      let candidates = [
+        PathBuf::from("/usr/bin/claude-desktop"),
+        PathBuf::from("/usr/local/bin/claude-desktop"),
+        PathBuf::from("/opt/claude-desktop/claude"),
+      ];
+      candidates.into_iter().find(|c| c.is_file())
+    })
+  }
 }
 
 struct ClaudeDesktopPaths {
@@ -1810,7 +2178,7 @@ struct ClaudeDesktopPaths {
 }
 
 fn claude_desktop_paths_in(home: &Path) -> ClaudeDesktopPaths {
-  let support = home.join("Library/Application Support");
+  let support = application_support_root(home);
   let normal = support.join("Claude");
   let third_party = support.join("Claude-3p");
   let library = third_party.join("configLibrary");
@@ -2027,9 +2395,17 @@ fn claude_desktop_running() -> bool {
     .unwrap_or(false)
 }
 
+// On Windows/Linux the app is a plain executable, so its process name is the
+// detected binary's file name (mirrors the OpenCode probe).
 #[cfg(not(target_os = "macos"))]
 fn claude_desktop_running() -> bool {
-  false
+  let Some(bin) = claude_desktop_app_path() else {
+    return false;
+  };
+  let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
+    return false;
+  };
+  desktop_process_running(&[name])
 }
 
 #[cfg(target_os = "macos")]
@@ -2063,7 +2439,21 @@ fn quit_claude_desktop() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn quit_claude_desktop() {}
+fn quit_claude_desktop() {
+  let Some(bin) = claude_desktop_app_path() else {
+    return;
+  };
+  let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
+    return;
+  };
+  desktop_process_quit(&[name]);
+  for _ in 0..10 {
+    if !claude_desktop_running() {
+      return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+  }
+}
 
 #[cfg(target_os = "macos")]
 fn open_claude_desktop() -> Result<(), String> {
@@ -2074,7 +2464,9 @@ fn open_claude_desktop() -> Result<(), String> {
 
 #[cfg(not(target_os = "macos"))]
 fn open_claude_desktop() -> Result<(), String> {
-  Err(String::from("Claude Desktop è disponibile solo su macOS."))
+  let bin = claude_desktop_app_path()
+    .ok_or_else(|| String::from("Claude Desktop non trovato: installalo da https://claude.com/download."))?;
+  desktop_spawn_app(&bin, &[], "Claude Desktop")
 }
 
 // Claude persists its settings while shutting down: the profile must be
@@ -2498,26 +2890,31 @@ fn hermes_app_path() -> Option<PathBuf> {
     .or_else(|| hermes_repo_app_path_in(&hermes_root_in(&home)))
 }
 
-#[cfg(not(target_os = "macos"))]
+// Windows: the desktop app is the GUI build (Hermes.exe), a separate surface
+// from the CLI, which is launched through hermes_cli_path — so `hermes` on PATH
+// is deliberately not a candidate here. The NSIS installer lays the app out
+// under %LOCALAPPDATA%\Programs; the HERMES-IDE spellings cover the older name.
+#[cfg(windows)]
 fn hermes_app_path() -> Option<PathBuf> {
-  for name in ["HERMES-IDE", "hermes-ide", "hermes"] {
-    if let Some(bin) = find_on_path(name) {
-      return Some(bin);
-    }
-  }
-  // The NSIS installer lays the app out under %LOCALAPPDATA%\Programs.
-  #[cfg(windows)]
-  if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-    let base = Path::new(&local_app_data).join("Programs");
-    for dir in ["hermes-ide", "HERMES-IDE"] {
-      for exe in ["HERMES-IDE.exe", "hermes-ide.exe"] {
-        let candidate = base.join(dir).join(exe);
-        if candidate.is_file() {
-          return Some(candidate);
-        }
+  let Ok(local) = std::env::var("LOCALAPPDATA") else {
+    return None;
+  };
+  let base = Path::new(&local).join("Programs");
+  for dir in ["hermes", "Hermes", "hermes-ide", "HERMES-IDE"] {
+    for exe in ["Hermes.exe", "HERMES-IDE.exe", "hermes-ide.exe"] {
+      let candidate = base.join(dir).join(exe);
+      if candidate.is_file() {
+        return Some(candidate);
       }
     }
   }
+  None
+}
+
+#[cfg(target_os = "linux")]
+fn hermes_app_path() -> Option<PathBuf> {
+  // There is no Linux build of the Hermes desktop app; the CLI is the only
+  // supported Hermes surface there.
   None
 }
 
@@ -2549,10 +2946,10 @@ fn hermes_cli_path() -> Option<PathBuf> {
   fallback.is_file().then_some(fallback)
 }
 
-// True when any Hermes process is live. The macOS bundle ships the app as
+// True when the Hermes desktop app is live. The macOS bundle ships the app as
 // "Hermes" (CFBundleExecutable), so the probe is case-sensitive on the exact
 // names; the lowercase spellings cover the older HERMES-IDE packaging.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn hermes_app_running() -> bool {
   for name in ["Hermes", "HERMES-IDE", "hermes-ide"] {
     let running = Command::new("pgrep")
@@ -2570,22 +2967,22 @@ fn hermes_app_running() -> bool {
   false
 }
 
+// Windows: probe the detected app's own image name (Hermes.exe, or the legacy
+// HERMES-IDE exe) so the running check and the quit stay in lockstep.
 #[cfg(windows)]
 fn hermes_app_running() -> bool {
-  for name in ["HERMES-IDE.exe", "hermes-ide.exe"] {
-    let Ok(output) = Command::new("tasklist")
-      .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
-      .stdin(Stdio::null())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::null())
-      .output()
-    else {
-      continue;
-    };
-    if String::from_utf8_lossy(&output.stdout).to_lowercase().contains("hermes-ide") {
-      return true;
-    }
-  }
+  let Some(bin) = hermes_app_path() else {
+    return false;
+  };
+  let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
+    return false;
+  };
+  desktop_process_running(&[name])
+}
+
+#[cfg(target_os = "linux")]
+fn hermes_app_running() -> bool {
+  // No Linux desktop app; the CLI running does not count as the app being up.
   false
 }
 
@@ -2844,29 +3241,15 @@ fn quit_hermes_app() {
 
 #[cfg(not(target_os = "macos"))]
 fn quit_hermes_app() {
-  #[cfg(windows)]
-  {
-    for name in ["HERMES-IDE.exe", "hermes-ide.exe"] {
-      let _ = Command::new("taskkill")
-        .args(["/F", "/IM", name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    }
-  }
-  #[cfg(unix)]
-  {
-    for name in ["HERMES-IDE", "hermes-ide", "hermes"] {
-      let _ = Command::new("pkill")
-        .arg("-x")
-        .arg(name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    }
-  }
+  // Kill only the detected desktop app's own image name; on Linux there is no
+  // desktop app so this is a no-op (it must never take down the CLI).
+  let Some(bin) = hermes_app_path() else {
+    return;
+  };
+  let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
+    return;
+  };
+  desktop_process_quit(&[name]);
   for _ in 0..10 {
     if !hermes_app_running() {
       return;
@@ -3458,6 +3841,37 @@ pub fn delete_mcp_server(app: tauri::AppHandle, id: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  // La radice dove un'app desktop tiene i dati utente è la base su cui Claude
+  // Desktop aggancia i suoi path di config; su macOS deve restare l'intero
+  // "Application Support" stabile, invariato rispetto al passato.
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn application_support_root_macos_is_application_support() {
+    let home = PathBuf::from("/home/bridge");
+    assert_eq!(
+      application_support_root(&home),
+      home.join("Library").join("Application Support")
+    );
+  }
+
+  // L'Exec di un .desktop è "binario [argomenti]": il lanciatore è il primo
+  // token, eventualmente prefissato da `path=`. Funzione pura, testabile su
+  // ogni host.
+  #[test]
+  fn desktop_entry_target_parses_exec_value() {
+    assert_eq!(
+      desktop_entry_target("/opt/opencode/opencode --app %U"),
+      Some("/opt/opencode/opencode".to_string())
+    );
+    assert_eq!(
+      desktop_entry_target("path=/usr/bin/claude-desktop --flag"),
+      Some("/usr/bin/claude-desktop".to_string())
+    );
+    assert_eq!(desktop_entry_target("opencode"), Some("opencode".to_string()));
+    assert_eq!(desktop_entry_target("   "), None);
+    assert_eq!(desktop_entry_target(""), None);
+  }
 
   // hive.json tiene anche il modello verificato, così un cambio di chiave
   // sa quale modello rimettere nelle config già scritte.

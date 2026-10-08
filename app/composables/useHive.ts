@@ -65,15 +65,21 @@ export interface McpStatus {
 
 export type SurfaceKind = 'desktop' | 'cli'
 
+// Operating system the app runs on, derived from the user agent at runtime.
+export type Platform = 'macos' | 'windows' | 'linux'
+
 // One launchable surface of a vendor: a concrete app or CLI. `service` is the
 // backend service id, `kind` selects the launch mode (desktop -> app,
-// cli -> terminal).
+// cli -> terminal). A desktop surface may restrict itself to some `platforms`
+// (a vendor may ship no desktop build for an OS, in which case the row is
+// hidden rather than shown as broken).
 export type ServiceSurface
   = {
     service: ServiceId
     kind: 'desktop'
     name: string
     downloadUrl: string
+    platforms?: Platform[]
   }
   | {
     service: ServiceId
@@ -151,7 +157,9 @@ export const SERVICE_GROUPS: ServiceGroup[] = [
         service: 'codex',
         kind: 'desktop',
         name: 'ChatGPT app',
-        downloadUrl: 'https://openai.com/chatgpt/download/'
+        downloadUrl: 'https://openai.com/chatgpt/download/',
+        // ChatGPT.app ships for macOS and Windows only; Linux is CLI-only.
+        platforms: ['macos', 'windows']
       },
       {
         service: 'codex',
@@ -174,7 +182,9 @@ export const SERVICE_GROUPS: ServiceGroup[] = [
         service: 'hermes',
         kind: 'desktop',
         name: 'Hermes Desktop',
-        downloadUrl: 'https://hermes-agent.nousresearch.com/'
+        downloadUrl: 'https://hermes-agent.nousresearch.com/',
+        // Hermes Desktop ships for macOS and Windows only; Linux is CLI-only.
+        platforms: ['macos', 'windows']
       },
       {
         service: 'hermes',
@@ -198,6 +208,29 @@ const SERVICE_LABELS: Record<ServiceId, string> = {
 }
 
 const ALL_SURFACES = SERVICE_GROUPS.flatMap(group => group.surfaces)
+
+// Runtime OS from the user agent; null outside a browser-like environment. The
+// app is client-only (ssr: false), so this resolves in practice. Tauri's
+// webviews report their host OS in the UA (WebView2 -> Windows, WebKitGTK ->
+// Linux, WKWebView -> Mac).
+function detectPlatform(): Platform | null {
+  if (typeof navigator === 'undefined') return null
+  const ua = navigator.userAgent
+  if (/Windows/i.test(ua)) return 'windows'
+  if (/Mac|iPhone|iPad/i.test(ua)) return 'macos'
+  if (/Linux/i.test(ua)) return 'linux'
+  return null
+}
+
+export const CURRENT_PLATFORM: Platform | null = detectPlatform()
+
+// A surface with no `platforms` is offered everywhere; a desktop surface lists
+// the OSes that ship it. Unknown platform is treated as "show everything" so a
+// web-mode preview never hides rows.
+export function isSurfaceAvailable(surface: ServiceSurface): boolean {
+  if (surface.kind !== 'desktop' || !surface.platforms) return true
+  return CURRENT_PLATFORM === null || surface.platforms.includes(CURRENT_PLATFORM)
+}
 
 export function surfaceKey(surface: ServiceSurface): string {
   return `${surface.service}:${surface.kind}`
