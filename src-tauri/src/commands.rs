@@ -2488,6 +2488,20 @@ fn hermes_repo_app_path_in(root: &Path) -> Option<PathBuf> {
   found.into_iter().next()
 }
 
+// Windows: the Hermes build puts the desktop app under
+// <root>/hermes-agent/apps/desktop/release/win-unpacked/Hermes.exe.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn hermes_windows_app_path_in(root: &Path) -> Option<PathBuf> {
+  let exe = root
+    .join("hermes-agent")
+    .join("apps")
+    .join("desktop")
+    .join("release")
+    .join("win-unpacked")
+    .join("Hermes.exe");
+  exe.is_file().then_some(exe)
+}
+
 // Detected Hermes installation: the .app bundle on macOS, the binary itself
 // elsewhere. The Linux/Windows binary names vary by packaging, so the known
 // spellings are probed on PATH plus the standard install locations.
@@ -2500,6 +2514,11 @@ fn hermes_app_path() -> Option<PathBuf> {
 
 #[cfg(not(target_os = "macos"))]
 fn hermes_app_path() -> Option<PathBuf> {
+  // Windows: the real desktop app first, because `hermes` on PATH is the CLI.
+  #[cfg(windows)]
+  if let Some(app) = home_dir().and_then(|home| hermes_windows_app_path_in(&hermes_root_in(&home))) {
+    return Some(app);
+  }
   for name in ["HERMES-IDE", "hermes-ide", "hermes"] {
     if let Some(bin) = find_on_path(name) {
       return Some(bin);
@@ -3869,6 +3888,25 @@ mod tests {
     std::fs::create_dir_all(&bundle).expect("create fake bundle");
     assert_eq!(hermes_repo_app_path_in(&tmp), Some(bundle));
     assert_eq!(hermes_repo_app_path_in(&tmp.join("vuoto")), None);
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+  
+  // Su Windows l'app desktop del checkout Hermes sta in
+  // apps/desktop/release/win-unpacked/Hermes.exe.
+  #[test]
+  fn finds_hermes_windows_app_in_the_checkout_release_dir() {
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-hermes-win-{}", std::process::id()));
+    let exe = tmp
+      .join("hermes-agent")
+      .join("apps")
+      .join("desktop")
+      .join("release")
+      .join("win-unpacked")
+      .join("Hermes.exe");
+    std::fs::create_dir_all(exe.parent().expect("exe parent")).expect("create fake release dir");
+    std::fs::write(&exe, b"").expect("create fake exe");
+    assert_eq!(hermes_windows_app_path_in(&tmp), Some(exe));
+    assert_eq!(hermes_windows_app_path_in(&tmp.join("vuoto")), None);
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
