@@ -81,7 +81,7 @@ jobs:
           trap 'rm -rf "$TMP"' EXIT
 
           for old in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
-            new="$(printf '%s' "$old" | sed -E "s/_${VER}_/_/; s/_x64_[a-z]{2}-[A-Z]{2}\.msi$/_x64.msi/; s/^ReQurv\.Launch-.*\.x86_64\.rpm$/ReQurv.Launch_x86_64.rpm/")"
+            new="$(printf '%s' "$old" | sed -E "s/_${VER}_/_/; s/_x64_[a-z]{2}-[A-Z]{2}\.msi$/_x64.msi/; s/^ReQurv\.Bridge-.*\.x86_64\.rpm$/ReQurv.Bridge_x86_64.rpm/")"
             if [ "$old" != "$new" ]; then
               echo "Renaming ${old} -> ${new}"
               gh release download "$TAG" --pattern "$old" --dir "$TMP" --clobber

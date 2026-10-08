@@ -19,8 +19,8 @@ The best contributions are **new connectors**: support for another agent, IDE or
 ### Setup
 
 ```bash
-git clone https://github.com/ReQurv/requrv-launch.git
-cd requrv-launch
+git clone https://github.com/ReQurv/requrv-bridge.git
+cd requrv-bridge
 bun install          # postinstall runs `nuxt prepare`
 bun run tauri dev    # Nuxt on :3001 + Tauri window
 ```

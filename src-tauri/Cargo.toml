@@ -4,7 +4,7 @@ version = "0.2.3"
 description = "Desktop launcher for AI coding agents pre-configured for AI Hive"
 authors = ["ReQurv"]
 license = "GPL-3.0-or-later"
-repository = "https://github.com/ReQurv/requrv-launch"
+repository = "https://github.com/ReQurv/requrv-bridge"
 edition = "2021"
 rust-version = "1.77.2"
 

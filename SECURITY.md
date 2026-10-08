@@ -5,7 +5,7 @@
 Please **do not** report security vulnerabilities through public GitHub issues.
 
 Report a potential vulnerability using the
-[**Report a vulnerability** button](https://github.com/ReQurv/requrv-launch/security/advisories/new)
+[**Report a vulnerability** button](https://github.com/ReQurv/requrv-bridge/security/advisories/new)
 on the GitHub Security tab (Private Vulnerability Reporting), or by email to
 [security@requrv.io](mailto:security@requrv.io).
 
@@ -15,7 +15,7 @@ us at least 90 days to develop and ship a fix before any public disclosure.
 
 ## Scope
 
-This policy covers the open-source ReQurv Launch application (this repository).
+This policy covers the open-source ReQurv Bridge application (this repository).
 The AI Hive gateway itself is a separate, closed service: report gateway issues
 to [security@requrv.io](mailto:security@requrv.io) as well.
 

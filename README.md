@@ -1,17 +1,17 @@
 # ReQurv Bridge
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-00DC82?logo=gnu)](./LICENSE)
-[![CI](https://img.shields.io/badge/CI-lint%20%2B%20typecheck%20%2B%20tests-00DC82?logo=githubactions)](https://github.com/ReQurv/requrv-launch/actions)
-[![Release](https://img.shields.io/github/v/release/ReQurv/requrv-launch?label=release)](https://github.com/ReQurv/requrv-launch/releases)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555)](https://github.com/ReQurv/requrv-launch/releases)
+[![CI](https://img.shields.io/badge/CI-lint%20%2B%20typecheck%20%2B%20tests-00DC82?logo=githubactions)](https://github.com/ReQurv/requrv-bridge/actions)
+[![Release](https://img.shields.io/github/v/release/ReQurv/requrv-bridge?label=release)](https://github.com/ReQurv/requrv-bridge/releases)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-555)](https://github.com/ReQurv/requrv-bridge/releases)
 
 ![ReQurv Bridge](public/logo_requrv_bridge.png)
 
 ReQurv Bridge is a desktop application that launches your AI coding agents pre-configured for [AI Hive](https://hive.requrv.ai), the ReQurv AI gateway.
 
-[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download%20for%20macOS%20(Apple%20Silicon)-dmg-00DC82?logo=apple&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Bridge_aarch64.dmg)
-[![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-msi%20%C2%B7%20exe-00DC82?logo=windows&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Bridge_x64-setup.exe)
-[![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-AppImage%20%C2%B7%20deb%20%C2%B7%20rpm-00DC82?logo=linux&logoColor=white)](https://github.com/ReQurv/requrv-launch/releases/latest/download/ReQurv.Bridge_amd64.AppImage)
+[![Download for macOS (Apple Silicon)](https://img.shields.io/badge/Download%20for%20macOS%20(Apple%20Silicon)-dmg-00DC82?logo=apple&logoColor=white)](https://github.com/ReQurv/requrv-bridge/releases/latest/download/ReQurv.Bridge_aarch64.dmg)
+[![Download for Windows](https://img.shields.io/badge/Download%20for%20Windows-msi%20%C2%B7%20exe-00DC82?logo=windows&logoColor=white)](https://github.com/ReQurv/requrv-bridge/releases/latest/download/ReQurv.Bridge_x64-setup.exe)
+[![Download for Linux](https://img.shields.io/badge/Download%20for%20Linux-AppImage%20%C2%B7%20deb%20%C2%B7%20rpm-00DC82?logo=linux&logoColor=white)](https://github.com/ReQurv/requrv-bridge/releases/latest/download/ReQurv.Bridge_amd64.AppImage)
 
 ![Screenshot](docs/screenshot.png)
 
@@ -41,7 +41,7 @@ On macOS the agents are TUI applications: the launch opens a script in the syste
 
 ## Installation
 
-Download the latest build for your platform from the [Releases page](https://github.com/ReQurv/requrv-launch/releases):
+Download the latest build for your platform from the [Releases page](https://github.com/ReQurv/requrv-bridge/releases):
 
 | Platform | Packages                              |
 | -------- | ------------------------------------- |

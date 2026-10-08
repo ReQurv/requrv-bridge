@@ -59,7 +59,7 @@ pub fn hive_anthropic_base_url() -> String {
 
 // Le release pubbliche dell'app: la più recente è la candidata aggiornamento.
 pub const GITHUB_LATEST_RELEASE_URL: &str =
-  "https://api.github.com/repos/ReQurv/requrv-launch/releases/latest";
+  "https://api.github.com/repos/ReQurv/requrv-bridge/releases/latest";
 
 const KEY_FILE_NAME: &str = "hive.json";
 
@@ -3176,7 +3176,7 @@ mod tests {
   // sa quale modello rimettere nelle config già scritte.
   #[test]
   fn key_file_keeps_key_and_model() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-key-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-key-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let path = tmp.join("hive.json");
     write_key_file(&path, "requrv_sk_vecchia", "requrv-small-3.8").unwrap();
@@ -3202,7 +3202,7 @@ mod tests {
   #[test]
   fn reapply_writes_the_new_key_into_configured_targets_only() {
     let tmp =
-      std::env::temp_dir().join(format!("requrv-launch-test-reapply-{}", std::process::id()));
+      std::env::temp_dir().join(format!("requrv-bridge-test-reapply-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let oc_dir = tmp.join(".config").join("opencode");
     std::fs::create_dir_all(&oc_dir).unwrap();
@@ -3481,7 +3481,7 @@ mod tests {
   // backend con --profile, che sposta HERMES_HOME.
   #[test]
   fn writes_hermes_provider_into_every_home() {
-    let root = std::env::temp_dir().join(format!("requrv-launch-test-hermes-config-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("requrv-bridge-test-hermes-config-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let profile_dir = root.join("profiles").join("developer");
     std::fs::create_dir_all(&profile_dir).unwrap();
@@ -3556,7 +3556,7 @@ mod tests {
   #[cfg(target_os = "macos")]
   #[test]
   fn finds_hermes_bundle_among_applications() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-hermes-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-hermes-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create fake Applications");
     let bundle = tmp.join("HERMES-IDE.app");
     std::fs::create_dir_all(&bundle).expect("create fake bundle");
@@ -3571,7 +3571,7 @@ mod tests {
   // non in /Applications: va trovata lì.
   #[test]
   fn finds_hermes_app_in_the_checkout_release_dir() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-hermes-repo-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-hermes-repo-{}", std::process::id()));
     let bundle = tmp
       .join("hermes-agent")
       .join("apps")
@@ -3635,7 +3635,7 @@ mod tests {
   #[cfg(not(windows))]
   #[test]
   fn finds_codex_in_nvm_bin_with_minimal_path() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-nvm-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-nvm-{}", std::process::id()));
     let bin_dir = tmp.join(".nvm").join("versions").join("node").join("v24.0.0").join("bin");
     std::fs::create_dir_all(&bin_dir).expect("create fake nvm bin");
     let fake = bin_dir.join("codex");
@@ -3766,7 +3766,7 @@ mod tests {
 
   #[test]
   fn config_path_prefers_existing_jsonc() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-cfg-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-cfg-{}", std::process::id()));
     let dir = tmp.join(".config").join("opencode");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     std::fs::write(dir.join("opencode.jsonc"), "{}").expect("write jsonc");
@@ -3778,7 +3778,7 @@ mod tests {
 
   #[test]
   fn config_path_defaults_to_jsonc_when_missing() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-cfg-empty-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-cfg-empty-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     let resolved = opencode_config_path_in(&tmp);
     assert!(resolved.to_string_lossy().ends_with("opencode.jsonc"));
@@ -3787,7 +3787,7 @@ mod tests {
 
   #[test]
   fn writes_and_backs_up_opencode_config() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-write-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-write-{}", std::process::id()));
     let dir = tmp.join(".config").join("opencode");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let existing = r#"{
@@ -3818,7 +3818,7 @@ mod tests {
   // non può sovrascriverlo col file già su Hive.
   #[test]
   fn opencode_backup_keeps_the_pre_hive_original_across_launches() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-oc-bak-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-oc-bak-{}", std::process::id()));
     let dir = tmp.join(".config").join("opencode");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let original = r#"{ "theme": "dark" }"#;
@@ -3843,7 +3843,7 @@ mod tests {
   #[test]
   fn opencode_restore_without_backup_keeps_foreign_providers_and_models() {
     let tmp =
-      std::env::temp_dir().join(format!("requrv-launch-test-oc-strip-{}", std::process::id()));
+      std::env::temp_dir().join(format!("requrv-bridge-test-oc-strip-{}", std::process::id()));
     let dir = tmp.join(".config").join("opencode");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     write_opencode_config_in(&tmp, "requrv-small-3.8", "requrv_sk_test").expect("write");
@@ -3872,7 +3872,7 @@ mod tests {
   #[test]
   fn opencode_restore_removes_the_file_when_nothing_else_is_left() {
     let tmp =
-      std::env::temp_dir().join(format!("requrv-launch-test-oc-empty-{}", std::process::id()));
+      std::env::temp_dir().join(format!("requrv-bridge-test-oc-empty-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
     write_opencode_config_in(&tmp, "requrv-small-3.8", "requrv_sk_test").expect("write");
     restore_opencode_config_in(&tmp).expect("restore");
@@ -3885,7 +3885,7 @@ mod tests {
   // riscritto come JSON valido, preservando i campi esterni.
   #[test]
   fn writes_opencode_config_with_trailing_commas() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-write-tc-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-write-tc-{}", std::process::id()));
     let dir = tmp.join(".config").join("opencode");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let existing = r#"{
@@ -3911,7 +3911,7 @@ mod tests {
 
   #[test]
   fn finds_desktop_app_bundle_among_candidates() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-app-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-app-{}", std::process::id()));
     let bundle = tmp.join("OpenCode.app");
     std::fs::create_dir_all(&bundle).expect("create fake bundle");
     let missing = tmp.join("Assente.app");
@@ -3922,7 +3922,7 @@ mod tests {
 
   #[test]
   fn finds_chatgpt_bundle_among_candidates() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-bundle-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-bundle-{}", std::process::id()));
     let bundle = tmp.join("ChatGPT.app");
     std::fs::create_dir_all(&bundle).expect("create fake bundle");
     let missing = tmp.join("Assente.app");
@@ -3932,7 +3932,7 @@ mod tests {
 
   #[test]
   fn finds_codex_binary_in_chatgpt_bundle() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-{}", std::process::id()));
     let resources = tmp.join("ChatGPT.app").join("Contents").join("Resources");
     std::fs::create_dir_all(&resources).expect("create fake bundle");
     std::fs::write(resources.join("codex"), "fake").expect("write fake codex");
@@ -3993,7 +3993,7 @@ mod tests {
   // se la variabile dichiarata manca).
   #[test]
   fn codex_provider_carries_bearer_token_for_app_and_cli() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-codex-key-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-codex-key-{}", std::process::id()));
     let models = vec![HiveModel { id: "requrv-small-3.8".into(), model_type: "TEXT_GENERATION".into() }];
     configure_chatgpt_app_in(&tmp, "requrv-small-3.8", &models, "requrv_sk_test").unwrap();
     let table: toml::Table = std::fs::read_to_string(codex_config_path_in(&tmp))
@@ -4012,7 +4012,7 @@ mod tests {
   #[test]
   fn restore_chatgpt_app_removes_legacy_cli_files() {
     let tmp =
-      std::env::temp_dir().join(format!("requrv-launch-test-codex-legacy-{}", std::process::id()));
+      std::env::temp_dir().join(format!("requrv-bridge-test-codex-legacy-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     std::fs::write(dir.join("hive.config.toml"), "model = \"x\"\n").unwrap();
@@ -4048,7 +4048,7 @@ mod tests {
 
   #[test]
   fn configure_chatgpt_app_writes_config_catalog_auth_and_backups() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-cfg-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-cfg-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let original_config = format!(
@@ -4116,7 +4116,7 @@ mod tests {
 
   #[test]
   fn configure_twice_keeps_the_original_backup() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-again-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-again-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let original = "model = \"gpt-5-codex\"\n";
@@ -4141,7 +4141,7 @@ mod tests {
   #[test]
   fn configure_on_scratch_home_never_backs_up_the_hive_config() {
     let tmp =
-      std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-scratch-{}", std::process::id()));
+      std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-scratch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let dir = tmp.join(".codex");
     let models = vec![HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() }];
@@ -4170,7 +4170,7 @@ mod tests {
   #[test]
   fn empty_model_list_keeps_the_existing_catalog() {
     let tmp =
-      std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-catalog-{}", std::process::id()));
+      std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-catalog-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let models = vec![
       HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() },
@@ -4195,7 +4195,7 @@ mod tests {
 
   #[test]
   fn restore_chatgpt_app_roundtrip() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-restore-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-restore-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let original_config = "model = \"gpt-5-codex\"\n";
@@ -4218,7 +4218,7 @@ mod tests {
 
   #[test]
   fn restore_without_backup_strips_legacy_hive_keys_and_own_auth() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-strip-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-strip-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let configured = format!(
@@ -4244,7 +4244,7 @@ mod tests {
 
   #[test]
   fn restore_without_backup_strips_hive_provider_and_keeps_foreign_ones() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-provider-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-provider-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let configured = format!(
@@ -4272,7 +4272,7 @@ mod tests {
 
   #[test]
   fn restore_without_backup_keeps_foreign_auth() {
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-chatgpt-auth-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-auth-{}", std::process::id()));
     let dir = tmp.join(".codex");
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let configured = format!("model = \"model-a\"\nopenai_base_url = \"{}\"\n", hive_openai_base_url());
@@ -4315,7 +4315,7 @@ mod tests {
     // the same timestamp and would then share (and clobber) one temp home.
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-cc-{}-{seq}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-cc-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join(".claude")).unwrap();
     tmp
@@ -4328,7 +4328,7 @@ mod tests {
     // then share (and clobber) one temp home.
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = std::env::temp_dir().join(format!("requrv-launch-test-cd-{}-{seq}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-cd-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let support = tmp.join("Library/Application Support");
     std::fs::create_dir_all(support.join("Claude")).unwrap();

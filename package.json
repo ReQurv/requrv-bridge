@@ -1,8 +1,8 @@
 {
-  "name": "requrv-launch",
+  "name": "requrv-bridge",
   "type": "module",
   "license": "GPL-3.0-or-later",
-  "repository": "https://github.com/ReQurv/requrv-launch",
+  "repository": "https://github.com/ReQurv/requrv-bridge",
   "scripts": {
     "build": "nuxt build",
     "dev": "nuxt dev",
