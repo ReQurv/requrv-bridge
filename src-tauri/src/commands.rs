@@ -2606,11 +2606,23 @@ const HERMES_PROVIDER_NAME: &str = "ReQurv";
 // Root of the Hermes installation/config. Mirrors what Hermes itself uses:
 // $HERMES_HOME when set, ~/.hermes otherwise.
 fn hermes_root_in(home: &Path) -> PathBuf {
-  std::env::var("HERMES_HOME")
+  if let Some(value) = std::env::var("HERMES_HOME")
     .ok()
     .filter(|value| !value.trim().is_empty())
-    .map(PathBuf::from)
-    .unwrap_or_else(|| home.join(".hermes"))
+  {
+    return PathBuf::from(value);
+  }
+  let default = home.join(".hermes");
+  // Windows: l'installer di Hermes usa %LOCALAPPDATA%\hermes
+  if cfg!(windows) && !default.exists() {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+      let candidate = PathBuf::from(local).join("hermes");
+      if candidate.exists() {
+        return candidate;
+      }
+    }
+  }
+  default
 }
 
 fn hermes_config_path_at(root: &Path) -> PathBuf {
