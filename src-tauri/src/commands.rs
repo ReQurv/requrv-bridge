@@ -557,6 +557,7 @@ fn application_support_root(home: &Path) -> PathBuf {
   #[cfg(target_os = "linux")]
   {
     std::env::var("XDG_CONFIG_HOME")
+      .ok()
       .map(PathBuf::from)
       .filter(|p| p.is_absolute())
       .unwrap_or_else(|| home.join(".config"))
@@ -737,7 +738,7 @@ fn desktop_process_running(names: &[&str]) -> bool {
       .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
-      .stderr(Stdio::null)
+      .stderr(Stdio::null())
       .output()
     else {
       continue;
@@ -760,7 +761,7 @@ fn desktop_process_running(names: &[&str]) -> bool {
       .arg(name)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
-      .stderr(Stdio::null)
+      .stderr(Stdio::null())
       .status()
       .is_ok_and(|s| s.success());
     if running {
@@ -779,7 +780,7 @@ fn desktop_process_quit(names: &[&str]) {
       .args(["/F", "/IM", name])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
-      .stderr(Stdio::null)
+      .stderr(Stdio::null())
       .spawn()
       .ok();
   }
@@ -793,7 +794,7 @@ fn desktop_process_quit(names: &[&str]) {
       .arg(name)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
-      .stderr(Stdio::null)
+      .stderr(Stdio::null())
       .spawn()
       .ok();
   }
