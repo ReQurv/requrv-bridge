@@ -540,9 +540,13 @@ fn home_dir() -> Option<PathBuf> {
     .map(PathBuf::from)
 }
 
-// Per-OS root where a desktop app keeps its user config/data: "Application
-// Support" on macOS, %APPDATA% on Windows, $XDG_CONFIG_HOME (else ~/.config)
-// on Linux. Only the current platform's branch compiles.
+// Per-OS root where a desktop app keeps its user config/data, derived from the
+// home dir: "~/Library/Application Support" on macOS, "~\AppData\Roaming"
+// (the default %APPDATA%) on Windows, "~/.config" on Linux. Derived from the
+// home parameter rather than the process environment so the pure
+// config-path builders stay deterministic and test-isolated (matching the
+// home-relative convention used by the other agents' config paths). Only the
+// current platform's branch compiles.
 fn application_support_root(home: &Path) -> PathBuf {
   #[cfg(target_os = "macos")]
   {
@@ -550,17 +554,11 @@ fn application_support_root(home: &Path) -> PathBuf {
   }
   #[cfg(windows)]
   {
-    std::env::var("APPDATA")
-      .map(PathBuf::from)
-      .unwrap_or_else(|_| home.join("AppData").join("Roaming"))
+    home.join("AppData").join("Roaming")
   }
   #[cfg(target_os = "linux")]
   {
-    std::env::var("XDG_CONFIG_HOME")
-      .ok()
-      .map(PathBuf::from)
-      .filter(|p| p.is_absolute())
-      .unwrap_or_else(|| home.join(".config"))
+    home.join(".config")
   }
 }
 
@@ -5032,7 +5030,7 @@ mod tests {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-cd-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    let support = tmp.join("Library/Application Support");
+    let support = application_support_root(&tmp);
     std::fs::create_dir_all(support.join("Claude")).unwrap();
     std::fs::create_dir_all(support.join("Claude-3p")).unwrap();
     // Pre-existing user state that restore must bring back.
@@ -5242,7 +5240,7 @@ mod tests {
   #[test]
   fn mcp_claude_desktop_roundtrip() {
     let home = mcp_test_home();
-    let support = home.join("Library/Application Support");
+    let support = application_support_root(&home);
     std::fs::create_dir_all(support.join("Claude")).unwrap();
     let path = support.join("Claude/claude_desktop_config.json");
     std::fs::write(&path, r#"{"deploymentMode":"1p"}"#).unwrap();
