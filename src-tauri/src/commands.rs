@@ -935,8 +935,8 @@ fn chatgpt_app_bundle() -> Option<PathBuf> {
     return None;
   };
   for entry in entries.flatten() {
-    let family = entry.file_name().to_string_lossy();
-    if !family.to_lowercase().contains("chatgpt") {
+    let name = entry.file_name();
+    if !name.to_string_lossy().to_lowercase().contains("chatgpt") {
       continue;
     }
     let base = entry.path();
