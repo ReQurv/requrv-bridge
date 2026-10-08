@@ -42,6 +42,27 @@ export interface HiveModel {
   model_type: string
 }
 
+export interface McpServer {
+  id: string
+  name: string
+  command: string
+  args: string[]
+  env: Record<string, string>
+  targets: string[]
+}
+
+export interface McpTarget {
+  id: string
+  label: string
+  installed: boolean
+}
+
+export interface McpStatus {
+  servers: McpServer[]
+  targets: McpTarget[]
+  configured: Record<string, Record<string, boolean>>
+}
+
 export type SurfaceKind = 'desktop' | 'cli'
 
 // One launchable surface of a vendor: a concrete app or CLI. `service` is the
@@ -250,6 +271,12 @@ const updateInfo = ref<UpdateInfo | null>(null)
 const checkingForUpdate = ref(false)
 const updateDismissed = ref(false)
 const projectDirectory = ref('')
+
+// MCP servers are a free list the user builds up; they are written into the
+// native config of the selected agents (see McpPanel.vue for the form).
+const mcpServers = ref<McpServer[]>([])
+const mcpTargets = ref<McpTarget[]>([])
+const mcpConfigured = ref<Record<string, Record<string, boolean>>>({})
 
 export function useHive() {
   const toast = useToast()
@@ -600,6 +627,62 @@ export function useHive() {
     }
   }
 
+  async function loadMcpServers() {
+    if (!isTauri.value) return
+    try {
+      const result = await invoke<McpStatus>('list_mcp_servers')
+      mcpServers.value = result.servers
+      mcpTargets.value = result.targets
+      mcpConfigured.value = result.configured
+    } catch (error) {
+      toast.add({
+        title: 'Impossibile caricare i server MCP',
+        description: String(error),
+        color: 'error'
+      })
+    }
+  }
+
+  async function saveMcpServer(server: McpServer): Promise<boolean> {
+    if (!isTauri.value) return false
+    try {
+      await invoke('save_mcp_server', { server })
+      toast.add({
+        title: `Server MCP ${server.name} salvato`,
+        color: 'success'
+      })
+      await loadMcpServers()
+      return true
+    } catch (error) {
+      toast.add({
+        title: 'Salvataggio server MCP non riuscito',
+        description: String(error),
+        color: 'error'
+      })
+      return false
+    }
+  }
+
+  async function removeMcpServer(id: string): Promise<boolean> {
+    if (!isTauri.value) return false
+    try {
+      await invoke('delete_mcp_server', { id })
+      toast.add({
+        title: 'Server MCP rimosso',
+        color: 'success'
+      })
+      await loadMcpServers()
+      return true
+    } catch (error) {
+      toast.add({
+        title: 'Rimozione server MCP non riuscita',
+        description: String(error),
+        color: 'error'
+      })
+      return false
+    }
+  }
+
   async function openExternal(url: string) {
     if (isTauri.value) {
       await openUrl(url)
@@ -639,6 +722,12 @@ export function useHive() {
     cancelRestart,
     restoreApp,
     openExternal,
-    chooseProjectDirectory
+    chooseProjectDirectory,
+    mcpServers,
+    mcpTargets,
+    mcpConfigured,
+    loadMcpServers,
+    saveMcpServer,
+    removeMcpServer
   }
 }

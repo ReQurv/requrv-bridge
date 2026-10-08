@@ -40,7 +40,10 @@ pub fn run() {
       commands::restart_claude_desktop_restored,
       commands::restore_claude_desktop,
       commands::open_claude_desktop_app,
-      commands::check_for_updates
+      commands::check_for_updates,
+      commands::list_mcp_servers,
+      commands::save_mcp_server,
+      commands::delete_mcp_server
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

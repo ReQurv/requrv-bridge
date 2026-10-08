@@ -3168,6 +3168,293 @@ pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateInfo, Stri
   })
 }
 
+// ---------------------------------------------------------------------------
+// Server MCP: lista libera + variabili d'ambiente
+// ---------------------------------------------------------------------------
+// Bridge keeps its own registry of MCP servers the user wants to expose to the
+// agents it launches. Each server is written into the native MCP config of the
+// selected targets (Claude Code, OpenCode, Claude Desktop). Entries are
+// inserted/removed surgically by id, so an agent's existing `mcpServers`
+// entries are never touched and there is no whole-file backup to restore.
+
+const MCP_FILE_NAME: &str = "mcp.json";
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct McpServer {
+  pub id: String,
+  pub name: String,
+  pub command: String,
+  #[serde(default)]
+  pub args: Vec<String>,
+  #[serde(default)]
+  pub env: serde_json::Map<String, serde_json::Value>,
+  #[serde(default)]
+  pub targets: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct McpTarget {
+  pub id: String,
+  pub label: String,
+  pub installed: bool,
+}
+
+#[derive(Serialize)]
+pub struct McpStatus {
+  pub servers: Vec<McpServer>,
+  pub targets: Vec<McpTarget>,
+  // server id -> target id -> present in that agent's config
+  pub configured: serde_json::Map<String, serde_json::Value>,
+}
+
+fn mcp_file_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+  let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+  Ok(dir.join(MCP_FILE_NAME))
+}
+
+fn read_mcp_registry(app: &tauri::AppHandle) -> Vec<McpServer> {
+  let Ok(path) = mcp_file_path(app) else {
+    return Vec::new();
+  };
+  match std::fs::read_to_string(path) {
+    Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw).unwrap_or_default(),
+    _ => Vec::new(),
+  }
+}
+
+fn write_mcp_registry(app: &tauri::AppHandle, servers: &[McpServer]) -> Result<(), String> {
+  let path = mcp_file_path(app)?;
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+  }
+  if let Ok(old) = std::fs::read_to_string(&path) {
+    let _ = std::fs::write(path.with_extension("json.bak"), old);
+  }
+  let rendered = serde_json::to_string_pretty(servers).map_err(|e| e.to_string())?;
+  std::fs::write(&path, rendered).map_err(|e| e.to_string())
+}
+
+// Native MCP config path of a target agent; None when it is not an MCP target.
+fn mcp_target_path_in(home: &Path, target: &str) -> Option<PathBuf> {
+  match target {
+    "claude_code" => Some(home.join(".claude.json")),
+    "opencode" => Some(opencode_config_path_in(home)),
+    "claude_desktop" => Some(claude_desktop_paths_in(home).normal_config),
+    _ => None,
+  }
+}
+
+fn mcp_container_key(target: &str) -> &'static str {
+  if target == "opencode" {
+    "mcp"
+  } else {
+    "mcpServers"
+  }
+}
+
+// Claude Code and Claude Desktop share the standard `mcpServers` shape;
+// OpenCode's local server puts the command first in the `command` array and
+// names the environment map `environment`.
+fn mcp_entry_value(target: &str, server: &McpServer) -> serde_json::Value {
+  match target {
+    "opencode" => {
+      let mut command = vec![server.command.clone()];
+      command.extend(server.args.iter().cloned());
+      serde_json::json!({
+        "type": "local",
+        "command": command,
+        "enabled": true,
+        "environment": server.env,
+      })
+    },
+    _ => serde_json::json!({
+      "command": server.command,
+      "args": server.args,
+      "env": server.env,
+    }),
+  }
+}
+
+fn read_mcp_config_in(
+  home: &Path,
+  target: &str,
+) -> Result<(PathBuf, serde_json::Value), String> {
+  let path = mcp_target_path_in(home, target)
+    .ok_or_else(|| format!("Target MCP non valido: {target}"))?;
+  let raw = match std::fs::read_to_string(&path) {
+    Ok(raw) => raw,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+      return Ok((path, serde_json::json!({})))
+    },
+    Err(e) => return Err(format!("Impossibile leggere {}: {e}", path.display())),
+  };
+  let cleaned = if target == "opencode" {
+    strip_trailing_commas(&strip_jsonc_comments(&raw))
+  } else {
+    raw
+  };
+  let config: serde_json::Value = serde_json::from_str(&cleaned)
+    .map_err(|e| format!("{} non è JSON valido: {e}", path.display()))?;
+  Ok((path, config))
+}
+
+fn mcp_target_present_in(home: &Path, target: &str, id: &str) -> bool {
+  let Ok((_, config)) = read_mcp_config_in(home, target) else {
+    return false;
+  };
+  config
+    .get(mcp_container_key(target))
+    .and_then(|container| container.get(id))
+    .is_some()
+}
+
+fn write_mcp_target_in(home: &Path, target: &str, server: &McpServer) -> Result<(), String> {
+  let (path, mut config) = read_mcp_config_in(home, target)?;
+  let Some(root) = config.as_object_mut() else {
+    return Err(format!("{} non è un oggetto JSON", path.display()));
+  };
+  let container = root
+    .entry(mcp_container_key(target))
+    .or_insert_with(|| serde_json::json!({}));
+  if !container.is_object() {
+    *container = serde_json::json!({});
+  }
+  let container = container.as_object_mut().expect("oggetto appena forzato");
+  container.insert(server.id.clone(), mcp_entry_value(target, server));
+  write_json(&path, &config)
+}
+
+fn strip_mcp_target_in(home: &Path, target: &str, id: &str) -> Result<(), String> {
+  let (path, mut config) = read_mcp_config_in(home, target)?;
+  let Some(root) = config.as_object_mut() else {
+    return Err(format!("{} non è un oggetto JSON", path.display()));
+  };
+  let Some(container) = root
+    .get_mut(mcp_container_key(target))
+    .and_then(|c| c.as_object_mut())
+  else {
+    return Ok(());
+  };
+  if container.remove(id).is_none() {
+    return Ok(());
+  }
+  if container.is_empty() {
+    root.remove(mcp_container_key(target));
+  }
+  write_json(&path, &config)
+}
+
+fn mcp_targets() -> Vec<McpTarget> {
+  vec![
+    McpTarget {
+      id: "claude_code".into(),
+      label: "Claude Code".into(),
+      installed: find_service_binary("claude").is_some(),
+    },
+    McpTarget {
+      id: "opencode".into(),
+      label: "OpenCode".into(),
+      installed: opencode_app_path().is_some() || find_service_binary("opencode").is_some(),
+    },
+    McpTarget {
+      id: "claude_desktop".into(),
+      label: "Claude Desktop".into(),
+      installed: claude_desktop_app_path().is_some(),
+    },
+  ]
+}
+
+#[tauri::command]
+pub fn list_mcp_servers(app: tauri::AppHandle) -> McpStatus {
+  let servers = read_mcp_registry(&app);
+  let targets = mcp_targets();
+  let mut configured = serde_json::Map::new();
+  if let Some(home) = home_dir() {
+    for server in &servers {
+      let mut map = serde_json::Map::new();
+      for target in &server.targets {
+        map.insert(
+          target.clone(),
+          serde_json::Value::Bool(mcp_target_present_in(&home, target, &server.id)),
+        );
+      }
+      configured.insert(server.id.clone(), serde_json::Value::Object(map));
+    }
+  }
+  McpStatus {
+    servers,
+    targets,
+    configured,
+  }
+}
+
+#[tauri::command]
+pub fn save_mcp_server(app: tauri::AppHandle, server: McpServer) -> Result<(), String> {
+  let id = server.id.trim();
+  if id.is_empty() {
+    return Err("L'identificativo MCP non può essere vuoto".into());
+  }
+  let command = server.command.trim();
+  if command.is_empty() {
+    return Err("Il comando MCP non può essere vuoto".into());
+  }
+  if server.targets.is_empty() {
+    return Err("Scegli almeno un agente in cui configurare l'MCP".into());
+  }
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let mut canonical = server.clone();
+  canonical.id = id.to_string();
+  canonical.command = command.to_string();
+  for target in &canonical.targets {
+    if mcp_target_path_in(&home, target).is_none() {
+      return Err(format!("Agente MCP non valido: {target}"));
+    }
+  }
+  // Write every selected target before touching the registry: a failure keeps
+  // mcp.json consistent with what is actually on disk.
+  for target in &canonical.targets {
+    write_mcp_target_in(&home, target, &canonical)
+      .map_err(|e| format!("{target}: {e}"))?;
+  }
+  let mut registry = read_mcp_registry(&app);
+  if let Some(slot) = registry.iter_mut().find(|s| s.id == canonical.id) {
+    *slot = canonical.clone();
+  } else {
+    registry.push(canonical.clone());
+  }
+  write_mcp_registry(&app, &registry)
+}
+
+#[tauri::command]
+pub fn delete_mcp_server(app: tauri::AppHandle, id: String) -> Result<(), String> {
+  let id = id.trim();
+  if id.is_empty() {
+    return Err("L'identificativo MCP non può essere vuoto".into());
+  }
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let registry = read_mcp_registry(&app);
+  let Some(server) = registry.iter().find(|s| s.id == id).cloned() else {
+    return Ok(());
+  };
+  // Remove the entry from every target the server was written to; if any file
+  // cannot be cleaned the registry entry is kept so the UI does not hide it.
+  let failures: Vec<String> = server
+    .targets
+    .iter()
+    .filter_map(|target| {
+      strip_mcp_target_in(&home, target, id)
+        .err()
+        .map(|e| format!("{target}: {e}"))
+    })
+    .collect();
+  if !failures.is_empty() {
+    return Err(format!("Rimozione MCP non completata: {}", failures.join("; ")));
+  }
+  let mut registry = registry;
+  registry.retain(|s| s.id != id);
+  write_mcp_registry(&app, &registry)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -4435,5 +4722,141 @@ mod tests {
     let home = home_dir().expect("home dir");
     restore_claude_desktop_in(&home).unwrap();
     println!("configured after restore: {}", claude_desktop_configured_in(&home));
+  }
+
+  // MCP: write/strip a server into each native client config, preserving
+  // foreign entries and using OpenCode's local-server shape.
+  fn mcp_test_home() -> PathBuf {
+    // Counter, not clock: parallel tests must not share a temp home.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-bridge-test-mcp-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    tmp
+  }
+
+  fn mcp_server_fixture() -> McpServer {
+    let env = serde_json::json!({"NEXTCLOUD_URL": "https://nc.local"})
+      .as_object()
+      .unwrap()
+      .clone();
+    McpServer {
+      id: "nextcloud".into(),
+      name: "Nextcloud".into(),
+      command: "nextcloud-mcp-server".into(),
+      args: vec!["run".into(), "--transport".into(), "stdio".into()],
+      env,
+      targets: vec!["claude_code".into(), "opencode".into(), "claude_desktop".into()],
+    }
+  }
+
+  #[test]
+  fn mcp_claude_code_roundtrip() {
+    let home = mcp_test_home();
+    let path = home.join(".claude.json");
+    std::fs::write(
+      &path,
+      r#"{"theme":"dark","mcpServers":{"existing":{"command":"existing-mcp","args":[]}}}"#,
+    )
+    .unwrap();
+
+    write_mcp_target_in(&home, "claude_code", &mcp_server_fixture()).unwrap();
+
+    let cfg: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(cfg["theme"], "dark");
+    assert_eq!(cfg["mcpServers"]["existing"]["command"], "existing-mcp");
+    assert_eq!(cfg["mcpServers"]["nextcloud"]["command"], "nextcloud-mcp-server");
+    assert_eq!(cfg["mcpServers"]["nextcloud"]["args"][0], "run");
+    assert_eq!(
+      cfg["mcpServers"]["nextcloud"]["env"]["NEXTCLOUD_URL"],
+      "https://nc.local"
+    );
+
+    strip_mcp_target_in(&home, "claude_code", "nextcloud").unwrap();
+    let cfg: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(cfg["mcpServers"].get("nextcloud").is_none());
+    assert_eq!(cfg["mcpServers"]["existing"]["command"], "existing-mcp");
+    assert_eq!(cfg["theme"], "dark");
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
+  fn mcp_opencode_roundtrip_keeps_foreign_keys() {
+    let home = mcp_test_home();
+    let dir = home.join(".config").join("opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("opencode.jsonc");
+    std::fs::write(
+      &path,
+      r#"// machine-generated
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": { "requrv-hive": { "npm": "@ai-sdk/openai-compatible" } },
+}"#,
+    )
+    .unwrap();
+
+    write_mcp_target_in(&home, "opencode", &mcp_server_fixture()).unwrap();
+
+    let read_cfg = |home: &Path| -> serde_json::Value {
+      let raw = std::fs::read_to_string(&home.join(".config/opencode/opencode.jsonc")).unwrap();
+      serde_json::from_str(&strip_trailing_commas(&strip_jsonc_comments(&raw))).unwrap()
+    };
+    let cfg = read_cfg(&home);
+    assert_eq!(cfg["$schema"], "https://opencode.ai/config.json");
+    assert_eq!(cfg["provider"]["requrv-hive"]["npm"], "@ai-sdk/openai-compatible");
+    let entry = &cfg["mcp"]["nextcloud"];
+    assert_eq!(entry["type"], "local");
+    assert_eq!(entry["enabled"], true);
+    assert_eq!(entry["command"][0], "nextcloud-mcp-server");
+    assert_eq!(entry["command"][1], "run");
+    assert_eq!(entry["environment"]["NEXTCLOUD_URL"], "https://nc.local");
+
+    strip_mcp_target_in(&home, "opencode", "nextcloud").unwrap();
+    let cfg = read_cfg(&home);
+    // The now-empty mcp container is dropped, everything else survives.
+    assert!(cfg.get("mcp").is_none());
+    assert_eq!(cfg["provider"]["requrv-hive"]["npm"], "@ai-sdk/openai-compatible");
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
+  fn mcp_claude_desktop_roundtrip() {
+    let home = mcp_test_home();
+    let support = home.join("Library/Application Support");
+    std::fs::create_dir_all(support.join("Claude")).unwrap();
+    let path = support.join("Claude/claude_desktop_config.json");
+    std::fs::write(&path, r#"{"deploymentMode":"1p"}"#).unwrap();
+
+    write_mcp_target_in(&home, "claude_desktop", &mcp_server_fixture()).unwrap();
+
+    let cfg: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(cfg["deploymentMode"], "1p");
+    assert_eq!(cfg["mcpServers"]["nextcloud"]["command"], "nextcloud-mcp-server");
+    assert_eq!(cfg["mcpServers"]["nextcloud"]["env"]["NEXTCLOUD_URL"], "https://nc.local");
+
+    strip_mcp_target_in(&home, "claude_desktop", "nextcloud").unwrap();
+    let cfg: serde_json::Value =
+      serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(cfg.get("mcpServers").is_none());
+    assert_eq!(cfg["deploymentMode"], "1p");
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  // Stripping from a file that never had the entry is a no-op and does not
+  // create the file.
+  #[test]
+  fn mcp_strip_missing_is_noop() {
+    let home = mcp_test_home();
+    let path = home.join(".claude.json");
+    assert!(!path.exists());
+    strip_mcp_target_in(&home, "claude_code", "nextcloud").unwrap();
+    assert!(!path.exists());
+    let _ = std::fs::remove_dir_all(&home);
   }
 }
