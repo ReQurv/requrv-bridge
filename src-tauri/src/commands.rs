@@ -865,6 +865,22 @@ fn opencode_app_path() -> Option<PathBuf> {
   ])
 }
 
+// Pure candidate search so the layout matching stays testable on any host.
+// The current per-user installer lays the app under the npm-scope directory
+// "@opencode-aidesktop"; the bare vendor names cover older layouts.
+#[cfg(any(windows, test))]
+fn opencode_app_path_in(roots: &[PathBuf]) -> Option<PathBuf> {
+  let mut candidates: Vec<PathBuf> = Vec::new();
+  for root in roots {
+    for dir in ["OpenCode", "opencode", "OpenCode Desktop", "@opencode-aidesktop"] {
+      for exe in ["OpenCode.exe", "opencode-desktop.exe", "OpenCode Desktop.exe"] {
+        candidates.push(root.join(dir).join(exe));
+      }
+    }
+  }
+  candidates.into_iter().find(|c| c.is_file())
+}
+
 #[cfg(windows)]
 fn opencode_app_path() -> Option<PathBuf> {
   // NSIS installers lay the Electron app under %LOCALAPPDATA%\Programs; a
@@ -878,15 +894,7 @@ fn opencode_app_path() -> Option<PathBuf> {
       roots.push(PathBuf::from(dir));
     }
   }
-  let mut candidates: Vec<PathBuf> = Vec::new();
-  for root in roots {
-    for dir in ["OpenCode", "opencode", "OpenCode Desktop"] {
-      for exe in ["OpenCode.exe", "opencode-desktop.exe", "OpenCode Desktop.exe"] {
-        candidates.push(root.join(dir).join(exe));
-      }
-    }
-  }
-  candidates.into_iter().find(|c| c.is_file())
+  opencode_app_path_in(&roots)
 }
 
 #[cfg(target_os = "linux")]
@@ -920,40 +928,111 @@ fn chatgpt_app_bundle() -> Option<PathBuf> {
   ])
 }
 
-// On Windows the ChatGPT app ships as a Microsoft Store (MSIX) package, so it
-// has no fixed install path: locate the per-user package that matches "chatgpt"
-// and find its launcher exe. The exact package family and exe sub-path are
-// device-dependent — the candidates here cover the common MSIX layouts and
-// must be confirmed on a real Store install.
+// The Store (MSIX) install of a desktop app keeps its binaries under the
+// ACL-protected "C:\Program Files\WindowsApps": a standard user cannot
+// enumerate that folder, but every file of their own package is readable by
+// exact path. The exact package folder name (it embeds the version) comes
+// from Get-AppxPackage, the in-package executable path from the manifest.
 #[cfg(windows)]
-fn chatgpt_app_bundle() -> Option<PathBuf> {
+fn appx_package_full_name(name_pattern: &str) -> Option<String> {
+  let output = Command::new("powershell")
+    .args([
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      &format!("(Get-AppxPackage -Name '{name_pattern}').PackageFullName"),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .output()
+    .ok()?;
+  if !output.status.success() {
+    return None;
+  }
+  let raw = String::from_utf8_lossy(&output.stdout);
+  raw.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_owned)
+}
+
+// Every Executable="..." attribute of the <Application elements (the
+// <Applications> container is skipped). The manifest is formatted XML, but a
+// linear scan keeps this dependency-free; callers try the paths in order and
+// the first one that exists on disk is the launcher.
+#[cfg(any(windows, test))]
+fn msix_manifest_executables(manifest: &str) -> Vec<String> {
+  const KEY: &str = "Executable=\"";
+  let mut out = Vec::new();
+  let mut from = 0;
+  while let Some(rel) = manifest[from..].find("<Application") {
+    let start = from + rel;
+    from = start + "<Application".len();
+    if manifest[from..].starts_with('s') {
+      continue;
+    }
+    let end = manifest[start..].find('>').map_or(manifest.len(), |rel| start + rel);
+    let tag = &manifest[start..end];
+    let Some(vrel) = tag.find(KEY) else {
+      continue;
+    };
+    let vstart = vrel + KEY.len();
+    let Some(vend) = tag[vstart..].find('"') else {
+      continue;
+    };
+    out.push(tag[vstart..vstart + vend].to_string());
+  }
+  out
+}
+
+// Resolve the launcher exe of a Store (MSIX) app. The cheap per-user data-dir
+// pre-check (%LOCALAPPDATA%\Packages\<Name>_<PublisherId>) keeps the
+// Get-AppxPackage spawn off the hot path on machines without the app; any of
+// the needles matching a data-dir name counts (a vendor can rename the
+// package between releases, e.g. OpenAI's ChatGPT app ships as OpenAI.Codex).
+#[cfg(windows)]
+fn msix_app_exe(name_patterns: &[&str], data_dir_needles: &[&str]) -> Option<PathBuf> {
   let Ok(local) = std::env::var("LOCALAPPDATA") else {
     return None;
   };
   let packages = Path::new(&local).join("Packages");
-  let Ok(entries) = std::fs::read_dir(&packages) else {
+  let needles: Vec<String> = data_dir_needles.iter().map(|n| n.to_lowercase()).collect();
+  let has_data = std::fs::read_dir(&packages).is_ok_and(|entries| {
+    entries.flatten().any(|e| {
+      let name = e.file_name().to_string_lossy().to_lowercase();
+      needles.iter().any(|n| name.contains(n.as_str()))
+    })
+  });
+  if !has_data {
+    return None;
+  }
+  let Ok(program_files) = std::env::var("ProgramFiles") else {
     return None;
   };
-  for entry in entries.flatten() {
-    let name = entry.file_name();
-    if !name.to_string_lossy().to_lowercase().contains("chatgpt") {
+  for pattern in name_patterns {
+    let Some(full_name) = appx_package_full_name(pattern) else {
       continue;
-    }
-    let base = entry.path();
-    for sub in ["", "Main", "ChatGPT", "app"] {
-      for exe in ["ChatGPT.exe", "app.exe"] {
-        let candidate = if sub.is_empty() {
-          base.join(exe)
-        } else {
-          base.join(sub).join(exe)
-        };
-        if candidate.is_file() {
-          return Some(candidate);
-        }
+    };
+    let pkg = Path::new(&program_files).join("WindowsApps").join(&full_name);
+    let Ok(manifest) = std::fs::read_to_string(pkg.join("AppxManifest.xml")) else {
+      continue;
+    };
+    for rel in msix_manifest_executables(&manifest) {
+      let exe = pkg.join(&rel);
+      if exe.is_file() {
+        return Some(exe);
       }
     }
   }
   None
+}
+
+// On Windows the ChatGPT desktop app ships as a Microsoft Store (MSIX)
+// package, so it has no fixed install path: the launcher is resolved from the
+// registered package (see msix_app_exe). Verified on a real device: the app
+// is published as "OpenAI.Codex" (OpenAI renamed the Windows package), with
+// the launcher at app/ChatGPT.exe inside the package dir.
+#[cfg(windows)]
+fn chatgpt_app_bundle() -> Option<PathBuf> {
+  msix_app_exe(&["ChatGPT*", "OpenAI.ChatGPT*", "OpenAI.Codex*"], &["chatgpt", "openai"])
 }
 
 #[cfg(target_os = "linux")]
@@ -2135,7 +2214,9 @@ fn claude_desktop_app_path() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_dir())
   }
   // Windows: the NSIS installer puts the Electron app under
-  // %LOCALAPPDATA%\Program\Claude (or a Program Files root for system installs).
+  // %LOCALAPPDATA%\Program\Claude (or a Program Files root for system installs);
+  // the Microsoft Store install is an MSIX package resolved via msix_app_exe
+  // (verified: Claude_2.31226.0.0_x64__pzs8sxrjxfjjc, exe app\Claude.exe).
   #[cfg(windows)]
   {
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -2148,7 +2229,10 @@ fn claude_desktop_app_path() -> Option<PathBuf> {
       }
     }
     let candidates = roots.into_iter().map(|root| root.join("Claude.exe")).collect::<Vec<_>>();
-    candidates.into_iter().find(|c| c.is_file())
+    candidates
+      .into_iter()
+      .find(|c| c.is_file())
+      .or_else(|| msix_app_exe(&["Claude*"], &["claude"]))
   }
   // Linux: prefer the .deb/.rpm's .desktop entry (it names the real binary);
   // the bare `claude` on PATH is the CLI, so it is not a candidate here.
@@ -3872,6 +3956,38 @@ mod tests {
     assert_eq!(desktop_entry_target(""), None);
   }
 
+  // L'installer Windows attuale pone l'app nella directory a scope npm
+  // "@opencode-aidesktop": la ricerca deve risolversi anche con quel layout.
+  #[test]
+  fn opencode_app_path_in_finds_scoped_installer_dir() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-bridge-test-opencode-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let scoped = tmp.join("@opencode-aidesktop");
+    std::fs::create_dir_all(&scoped).unwrap();
+    std::fs::write(scoped.join("OpenCode.exe"), "stub").unwrap();
+    let roots = vec![tmp.clone()];
+    assert_eq!(opencode_app_path_in(&roots), Some(scoped.join("OpenCode.exe")));
+    // Una root senza installazione non deve risolversi a nulla.
+    assert_eq!(opencode_app_path_in(&[tmp.join("vuoto")]), None);
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Nel manifest il contenitore <Applications> va saltato e gli attributi
+  // possono essere su più righe: restano gli Executable dei soli elementi
+  // <Application, in ordine.
+  #[test]
+  fn msix_manifest_executables_skips_container_and_parses_attrs() {
+    let manifest = "<Package>\n  <Applications>\n    <Application Id=\"Claude\" \nExecutable=\"app\\Claude.exe\" EntryPoint=\"Windows.FullTrustApplication\">\n    </Application>\n    <Application Id=\"SshAskpass\" Executable=\"app\\resources\\claude-ssh-askpass.exe\">\n    </Application>\n  </Applications>\n</Package>\n";
+    assert_eq!(
+      msix_manifest_executables(manifest),
+      vec!["app\\Claude.exe".to_string(), "app\\resources\\claude-ssh-askpass.exe".to_string()]
+    );
+    // Nessun elemento <Application: solo il contenitore, nessun risultato.
+    assert_eq!(msix_manifest_executables("<Package><Applications/></Package>"), Vec::<String>::new());
+    assert_eq!(msix_manifest_executables(""), Vec::<String>::new());
+  }
+
   // hive.json tiene anche il modello verificato, così un cambio di chiave
   // sa quale modello rimettere nelle config già scritte.
   #[test]
@@ -4924,7 +5040,8 @@ mod tests {
     let configured = format!(
       "model = \"model-a\"\nnotify = [\"bar\"]\nopenai_base_url = \"{}\"\nmodel_catalog_json = \"{}\"\n",
       hive_openai_base_url(),
-      dir.join("hive-models.json").display()
+      // Le backslash del path Windows vanno escapate: nel TOML sono escape.
+      dir.join("hive-models.json").display().to_string().replace('\\', "\\\\")
     );
     std::fs::write(dir.join("config.toml"), configured).expect("write config");
     std::fs::write(dir.join("auth.json"), r#"{"OPENAI_API_KEY": "requrv_sk_test", "auth_mode": "apikey"}"#)
@@ -4949,7 +5066,8 @@ mod tests {
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let configured = format!(
       "model = \"model-a\"\nnotify = [\"bar\"]\nmodel_provider = \"{HIVE_PROVIDER_ID}\"\nmodel_catalog_json = \"{}\"\n\n[model_providers.{HIVE_PROVIDER_ID}]\nbase_url = \"{}\"\nwire_api = \"responses\"\nsupports_websockets = false\n\n[model_providers.other]\nbase_url = \"https://example.com/v1\"\n",
-      dir.join("hive-models.json").display(),
+      // Le backslash del path Windows vanno escapate: nel TOML sono escape.
+      dir.join("hive-models.json").display().to_string().replace('\\', "\\\\"),
       hive_openai_base_url()
     );
     std::fs::write(dir.join("config.toml"), configured).expect("write config");
@@ -5137,6 +5255,34 @@ mod tests {
     println!("configured after restore: {}", claude_desktop_configured_in(&home));
   }
 
+  // Detection dell'installazione Store (MSIX) contro la macchina reale,
+  // attraverso il vero entry point (candidati NSIS prima, poi msix_app_exe):
+  //   cargo test claude_desktop_msix_real_machine -- --ignored --nocapture
+  // Da eseguire solo su un Windows con l'app Claude del Microsoft Store.
+  #[cfg(windows)]
+  #[test]
+  #[ignore]
+  fn claude_desktop_msix_real_machine() {
+    let exe = claude_desktop_app_path()
+      .expect("Claude Desktop non trovato: il test va eseguito su un PC con l'app Store installata");
+    assert!(exe.is_file());
+    println!("claude desktop exe: {}", exe.display());
+  }
+
+  // Detection di ChatGPT (Store/MSIX, pubblicato come OpenAI.Codex) contro la
+  // macchina reale:
+  //   cargo test chatgpt_app_msix_real_machine -- --ignored --nocapture
+  // Da eseguire solo su un Windows con l'app ChatGPT del Microsoft Store.
+  #[cfg(windows)]
+  #[test]
+  #[ignore]
+  fn chatgpt_app_msix_real_machine() {
+    let exe = chatgpt_app_bundle()
+      .expect("ChatGPT app non trovata: il test va eseguito su un PC con l'app Store installata");
+    assert!(exe.is_file());
+    println!("chatgpt app exe: {}", exe.display());
+  }
+
   // MCP: write/strip a server into each native client config, preserving
   // foreign entries and using OpenCode's local-server shape.
   fn mcp_test_home() -> PathBuf {
@@ -5216,7 +5362,7 @@ mod tests {
     write_mcp_target_in(&home, "opencode", &mcp_server_fixture()).unwrap();
 
     let read_cfg = |home: &Path| -> serde_json::Value {
-      let raw = std::fs::read_to_string(&home.join(".config/opencode/opencode.jsonc")).unwrap();
+      let raw = std::fs::read_to_string(home.join(".config/opencode/opencode.jsonc")).unwrap();
       serde_json::from_str(&strip_trailing_commas(&strip_jsonc_comments(&raw))).unwrap()
     };
     let cfg = read_cfg(&home);
