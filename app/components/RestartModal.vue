@@ -2,7 +2,6 @@
 const hive = useHive()
 const { restartModalOpen, restarting, restartTarget } = hive
 
-const isHermes = computed(() => restartTarget.value === 'hermes')
 // Bare vendor names, matching SERVICE_LABELS in useHive.
 const APP_LABELS: Record<string, string> = {
   codex: 'ChatGPT',
@@ -11,16 +10,8 @@ const APP_LABELS: Record<string, string> = {
   claude_desktop: 'Claude'
 }
 const appLabel = computed(() => APP_LABELS[restartTarget.value ?? ''] ?? 'ChatGPT')
-const description = computed(() =>
-  isHermes.value
-    ? 'La configurazione viene applicata solo al nuovo processo.'
-    : 'Le impostazioni vengono lette all\'avvio dell\'app.'
-)
-const body = computed(() =>
-  isHermes.value
-    ? 'Riavviare Hermes per applicare la configurazione AI Hive? Una sessione in corso verrà chiusa.'
-    : `Riavviare ${appLabel.value} per applicare i cambiamenti? Una sessione in corso verrà chiusa.`
-)
+const description = 'Le impostazioni salvate vengono lette all\'avvio dell\'app.'
+const body = computed(() => `Riavviare ${appLabel.value} per applicare i cambiamenti? Una sessione in corso verrà chiusa.`)
 </script>
 
 <template>

@@ -1,4 +1,6 @@
 mod commands;
+#[cfg(any(target_os = "macos", windows, test))]
+mod terminal;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -33,6 +35,7 @@ pub fn run() {
       commands::restart_chatgpt_app,
       commands::restore_chatgpt_app,
       commands::launch_hermes_app,
+      commands::open_hermes_app,
       commands::restart_hermes_app,
       commands::restore_hermes,
       commands::configure_claude_desktop,

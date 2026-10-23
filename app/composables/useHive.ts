@@ -357,7 +357,7 @@ export function useHive() {
     }
   }
 
-  async function loadModels(): Promise<boolean> {
+  async function loadModels(notify = true): Promise<boolean> {
     if (!key.value.trim()) return false
     try {
       models.value = await invoke<HiveModel[]>('list_hive_models', {
@@ -369,25 +369,32 @@ export function useHive() {
       }
       return true
     } catch (error) {
-      toast.add({
-        title: 'Impossibile caricare i modelli da AI Hive',
-        description: String(error),
-        color: 'error'
-      })
+      if (notify) {
+        toast.add({
+          title: 'Impossibile caricare i modelli da AI Hive',
+          description: String(error),
+          color: 'error'
+        })
+      }
       return false
     }
   }
 
   async function saveKey(): Promise<boolean> {
     const trimmed = key.value.trim()
-    if (!trimmed || saving.value) return false
+    if (!isTauri.value || !trimmed || saving.value || launching.value || restoring.value || restarting.value || restartModalOpen.value) return false
     saving.value = true
     try {
       // The backend realigns every config it already wrote with the new key.
       await invoke('set_hive_key', { key: trimmed, model: selectedModel.value })
       key.value = trimmed
       keySaved.value = true
-      if (!(await loadModels())) {
+      if (!(await loadModels(false))) {
+        toast.add({
+          title: 'Chiave salvata, verifica dei modelli non riuscita',
+          description: 'La chiave è stata salvata, ma AI Hive non ha restituito i modelli.',
+          color: 'warning'
+        })
         return false
       }
       toast.add({
@@ -397,12 +404,26 @@ export function useHive() {
       })
       return true
     } catch (error) {
+      // set_hive_key can save the key before reporting a failure while it
+      // reapplies existing integrations. Read back the actual saved value so
+      // the key status and input do not become stale.
+      let savedKey: string | null = null
+      try {
+        savedKey = await invoke<string | null>('get_hive_key')
+      } catch {
+        // Keep the current UI state if the persisted value cannot be read.
+      }
+      if (savedKey !== null) {
+        key.value = savedKey
+        keySaved.value = !!savedKey
+        if (savedKey === trimmed) await loadModels(false)
+      }
       toast.add({
-        // The key is saved: only updating an already-written config failed,
-        // and the description says which one.
-        title: 'Chiave salvata, configurazione da aggiornare',
+        title: savedKey === trimmed
+          ? 'Chiave salvata, configurazione da aggiornare'
+          : 'Salvataggio della chiave non riuscito',
         description: String(error),
-        color: 'warning'
+        color: savedKey === trimmed ? 'warning' : 'error'
       })
       return false
     } finally {
@@ -450,7 +471,7 @@ export function useHive() {
   async function launch(surface: ServiceSurface) {
     const { service } = surface
     const mode: LaunchMode = surface.kind === 'desktop' ? 'app' : 'terminal'
-    if (!key.value.trim() || !selectedModel.value || launching.value) return
+    if (!isTauri.value || !key.value.trim() || !selectedModel.value || launching.value || saving.value || restoring.value || restarting.value || restartModalOpen.value) return
     launching.value = surfaceKey(surface)
 
     try {
@@ -472,6 +493,7 @@ export function useHive() {
         })
         if (result.restart_required) {
           restartTarget.value = 'codex'
+          restartAction.value = 'configure'
           restartModalOpen.value = true
         } else {
           await invoke('open_chatgpt_app')
@@ -501,15 +523,15 @@ export function useHive() {
         return
       }
       if (service === 'hermes' && mode === 'app') {
-        // Anche l'app desktop si configura con sole variabili d'ambiente, ma
-        // un'istanza già aperta non può riceverle: serve il riavvio. (La CLI
-        // parte come processo nuovo, quindi passa dal ramo generico.)
+        // Configura i file condivisi da CLI e app. Un'istanza già aperta legge
+        // le modifiche al riavvio; la CLI parte come processo nuovo.
         const result = await invoke<AppRestartResult>('launch_hermes_app', {
           model: selectedModel.value,
           key: key.value.trim()
         })
         if (result.restart_required) {
           restartTarget.value = 'hermes'
+          restartAction.value = 'configure'
           restartModalOpen.value = true
         } else {
           toast.add({
@@ -570,6 +592,7 @@ export function useHive() {
     const service = restartTarget.value
     restartModalOpen.value = false
     if (!service || (service !== 'codex' && service !== 'hermes' && service !== 'claude_desktop' && service !== 'opencode')) return
+    if (!isTauri.value) return
     const label = SERVICE_LABELS[service]
     restarting.value = true
     try {
@@ -587,13 +610,12 @@ export function useHive() {
       } else if (service === 'opencode') {
         await invoke('restart_opencode_app')
       } else {
-        await invoke('restart_hermes_app', {
-          model: selectedModel.value,
-          key: key.value.trim()
-        })
+        await invoke('restart_hermes_app')
       }
       toast.add({
-        title: `${label} riavviato con AI Hive`,
+        title: restartAction.value === 'restore'
+          ? `${label} riavviato con la configurazione originale`
+          : `${label} riavviato con AI Hive`,
         color: 'success'
       })
     } catch (error) {
@@ -614,13 +636,14 @@ export function useHive() {
     if (!service) return
     const label = SERVICE_LABELS[service]
     toast.add({
-      title: `${label} si aggiornerà al prossimo avvio`,
+      title: restartAction.value === 'restore'
+        ? `La configurazione originale di ${label} verrà letta al prossimo avvio`
+        : `${label} si aggiornerà al prossimo avvio`,
       color: 'info'
     })
   }
 
-  // Every target that persists something can be restored; Hermes is env-only,
-  // so it never shows the button.
+  // Each harness persists configuration and exposes its matching restore command.
   const RESTORE_COMMANDS: Record<ServiceId, string> = {
     codex: 'restore_chatgpt_app',
     claude_desktop: 'restore_claude_desktop',
@@ -631,7 +654,7 @@ export function useHive() {
 
   async function restoreApp(service: ServiceId) {
     const command = RESTORE_COMMANDS[service]
-    if (!command || !isTauri.value || restoring.value) return
+    if (!command || !isTauri.value || restoring.value || saving.value || launching.value || restarting.value || restartModalOpen.value) return
     restoring.value = true
     const label = SERVICE_LABELS[service]
     try {
@@ -646,8 +669,6 @@ export function useHive() {
         restartTarget.value = service
         restartAction.value = 'restore'
         restartModalOpen.value = true
-      } else {
-        await refreshStatus()
       }
     } catch (error) {
       toast.add({
@@ -657,6 +678,7 @@ export function useHive() {
       })
     } finally {
       restoring.value = false
+      await refreshStatus()
     }
   }
 

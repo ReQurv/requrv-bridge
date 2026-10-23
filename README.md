@@ -17,27 +17,29 @@ ReQurv Bridge is a desktop application that launches your AI coding agents pre-c
 
 ## Supported agents
 
-- [OpenCode](https://opencode.ai) — coding IDE (on macOS both the desktop app and the CLI are supported, elsewhere the CLI)
-- [Codex](https://chatgpt.com/codex) — OpenAI's coding CLI (on macOS the ChatGPT app is also supported)
-- [Claude Code](https://claude.com/product/claude-code) — Anthropic's coding agent (CLI)
-- [Hermes](https://hermes-ide.com) — coding IDE whose Agent mode runs on the Claude Agent SDK (desktop app)
+| Harness | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| [OpenCode](https://opencode.ai) | App + CLI | App + CLI | App + CLI |
+| [ChatGPT / Codex](https://chatgpt.com/codex) | ChatGPT Codex mode + CLI | ChatGPT Codex mode + CLI | CLI |
+| [Claude Code](https://claude.com/product/claude-code) | CLI | CLI | CLI |
+| [Claude Desktop](https://claude.com/download) | Chat in gateway mode | Chat in gateway mode | Desktop entry detection |
+| [Hermes Agent](https://hermes-agent.nousresearch.com/) | App + CLI | App + CLI | CLI |
+
+These are implemented targets, not a certification of every installer/version. See the [macOS and Windows validation procedure](docs/harness-validation.md) for the test matrix, expected behavior and remaining runtime checks.
 
 ## Features
 
-- Save and verify your AI Hive API key (validated against the gateway when saved)
-- List the models available on AI Hive and pick a default one
-- Automatic detection of installed agents (with support for nvm, Volta, Homebrew, global npm installs and stale Windows registry PATH entries)
-- One-click launch:
-  - **Target choice**: the app and CLI appear as separate actions, so you launch the installed surface directly
-  - **CLI installation**: when a CLI is not detected, its card shows the official platform-specific installer command and documentation. Run the copied command in your terminal, then return and click "Rileva"
-  - **CLI project folder**: the first CLI launch opens a folder picker; its selection is reused for the app session and can be changed with the "Cambia cartella" button in the project-folder panel. Every CLI launch uses that path as its working directory (Terminal on macOS; process working directory on Linux/Windows)
-  - **OpenCode**: writes the `requrv-hive` provider into the global config file (`~/.config/opencode/opencode.jsonc` or `.json`), preserving other settings, and can restore it with one click from the card's restore button (the original file is backed up as `.bak`, and the backup is never overwritten by later launches)
-  - **Codex (terminal)**: points `~/.codex/config.toml` at AI Hive exactly like ChatGPT.app does (same `requrv-hive` provider, `wire_api = "responses"`, model catalog, no WebSocket) and launches the CLI with the `HIVE_API_KEY` variable; a `codex` typed by hand in a terminal also uses AI Hive. The configuration is shared between the two surfaces, so launching one re-points the other (the app re-reads it on every request, no restart needed)
-  - **ChatGPT.app (app, macOS only)**: points `~/.codex/config.toml` at AI Hive through a dedicated `requrv-hive` provider (`base_url`, `wire_api = "responses"`, key included; no WebSocket, which the gateway does not support) plus a model catalog in `~/.codex/hive-models.json`, and saves the key in `~/.codex/auth.json` in apikey mode; the original files are backed up as `.hive.bak` and can be restored with one click from the "Restore ChatGPT" button. The model catalog is read at startup, so if the app is already open a restart is requested
-  - **Claude Code (terminal)**: writes the AI Hive routing into the `env` block of `~/.claude/settings.json` (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, plus the per-model context window), preserving every other setting of yours, and also passes those variables to the launched process. Because the client applies that file, the configuration survives Bridge: a `claude` started by hand, in a new terminal with no Hive variables, goes to AI Hive. The original file is backed up (`settings.json.hive.bak`) and can be restored with one click. First it verifies that the gateway exposes the `/messages` endpoint (Anthropic Messages API). (The Code tab of Claude Desktop is not supported: in consumer versions it is bound to the claude.ai account and cannot use an external gateway)
-  - **Hermes (app)**: launches the app with the AI Hive configuration passed as environment variables only (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`), without writing any configuration file; first verifies that the gateway exposes the `/messages` endpoint (Anthropic Messages API). Since the environment only applies to the launched process, if an instance is already open a restart is requested
+- Save an AI Hive key locally, fetch the available models and choose a model.
+- Detect app and CLI installations separately, including common Node version managers and Windows Store installations.
+- Launch CLIs in a selected project directory using Terminal on macOS and a PowerShell console on Windows.
+- Persist the Hive provider in each harness's native configuration, preserving unrelated settings. OpenCode, Codex/ChatGPT and Hermes share configuration between their desktop and CLI surfaces.
+- Keep an initial backup and offer restore. Desktop applications already running require a confirmed restart to load configured or restored settings.
+- Update already-managed configurations when the saved Hive key changes, including Hermes profiles and Claude Desktop.
+- Distribute user-defined MCP servers to Claude Code, OpenCode and Claude Desktop.
 
-On macOS the agents are TUI applications: the launch opens a script in the system terminal, providing a real TTY.
+OpenCode uses a `requrv-hive` provider in its global JSON/JSONC config. Codex and ChatGPT's Codex surface share `~/.codex/config.toml`, a generated model catalog and API-key authentication; the custom provider uses Responses over HTTP, with WebSocket disabled and `CODEX_HOME` pinned. Claude Code merges Anthropic gateway variables into `~/.claude/settings.json`. Hermes writes a named provider into its default and existing profile YAML configurations. Claude Desktop uses a third-party gateway profile, independently of Claude Code.
+
+Configuration survives Bridge's exit. Restoring a shared configuration affects both surfaces and can return the whole file to the initial snapshot. ChatGPT's ordinary chat/voice and Claude Desktop's consumer Code tab are outside this routing. Claude Desktop's displayed Hive model depends on the gateway mapping its Anthropic-compatible model slot; verify the actual routed model during validation.
 
 ## Installation
 
@@ -131,7 +133,7 @@ Releases are automated: CI (`.github/workflows/build.yml`) builds for macOS, Lin
 
 ## CI
 
-CI (`.github/workflows/ci.yml`) runs lint, typecheck and the Rust tests on every push.
+CI (`.github/workflows/ci.yml`) runs frontend lint/typecheck and Rust tests plus Clippy on macOS, Windows and Linux on every push. Real-device launch, streaming and tool-use checks are tracked separately in the [validation procedure](docs/harness-validation.md).
 
 ## Contributing
 
