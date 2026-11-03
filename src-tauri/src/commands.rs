@@ -3390,10 +3390,10 @@ fn hermes_app_running() -> bool {
 const HERMES_CONFIG_FILE: &str = "config.yaml";
 const HERMES_PROVIDER_KEY: &str = "requrv";
 const HERMES_PROVIDER_NAME: &str = "ReQurv";
-// The gateway bills the thinking budget, and Hermes' default level reasons far
-// longer than a coding session here needs: every written config pins the lowest
-// enabled effort. The CLI's own picker still lets the user raise it per session.
-const HERMES_REASONING_EFFORT: &str = "minimal";
+// The gateway advertises the reasoning levels it accepts (low/medium/xhigh for
+// the current models); the launcher pins the middle one, so a session reasons
+// as much as the model is meant to. The CLI's picker still allows raising it.
+const HERMES_REASONING_EFFORT: &str = "medium";
 
 fn hermes_root_for_platform(
   home: &Path,
@@ -4770,7 +4770,7 @@ mod tests {
       assert_eq!(parsed["providers"]["requrv"]["api_key"], "requrv_sk_test");
       assert!(parsed["providers"]["requrv"]["models"].get("requrv-small-3.8").is_some());
       // Il ragionamento è pinnato al livello minimo attivo: la CLI pensa meno.
-      assert_eq!(parsed["agent"]["reasoning_effort"], "minimal");
+      assert_eq!(parsed["agent"]["reasoning_effort"], "medium");
       assert_eq!(parsed["database"]["journal_mode"], "wal");
       assert_eq!(parsed["custom_providers"], serde_yaml::Value::Sequence(vec![]));
     }
@@ -4796,7 +4796,7 @@ mod tests {
     assert_eq!(value["model"]["temperature"], 0.25);
     assert_eq!(value["model"]["extra"], "keep");
     assert_eq!(value["agent"]["max_turns"], 7);
-    assert_eq!(value["agent"]["reasoning_effort"], "minimal");
+    assert_eq!(value["agent"]["reasoning_effort"], "medium");
     assert_eq!(value["model"]["default"], "model with spaces:latest");
     assert_eq!(value["providers"]["openai"]["name"], "OpenAI");
     assert_eq!(value["providers"]["requrv"]["api_key"], "key: with spaces");
