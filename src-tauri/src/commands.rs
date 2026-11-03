@@ -3390,6 +3390,10 @@ fn hermes_app_running() -> bool {
 const HERMES_CONFIG_FILE: &str = "config.yaml";
 const HERMES_PROVIDER_KEY: &str = "requrv";
 const HERMES_PROVIDER_NAME: &str = "ReQurv";
+// The gateway bills the thinking budget, and Hermes' default level reasons far
+// longer than a coding session here needs: every written config pins the lowest
+// enabled effort. The CLI's own picker still lets the user raise it per session.
+const HERMES_REASONING_EFFORT: &str = "minimal";
 
 fn hermes_root_for_platform(
   home: &Path,
@@ -3481,6 +3485,12 @@ fn merge_hermes_provider(raw: &str, model: &str, key: &str, path: &Path) -> Resu
   model_map.insert(yaml_string("default"), yaml_string(model));
   model_map.insert(yaml_string("provider"), yaml_string(&format!("custom:{HERMES_PROVIDER_KEY}")));
   model_map.insert(yaml_string("base_url"), yaml_string(&hive_openai_base_url()));
+
+  let agent = yaml_mapping_at(root, "agent", path)?;
+  agent.insert(
+    yaml_string("reasoning_effort"),
+    yaml_string(HERMES_REASONING_EFFORT),
+  );
 
   let providers = yaml_mapping_at(root, "providers", path)?;
   let provider = yaml_mapping_at(providers, HERMES_PROVIDER_KEY, path)?;
@@ -3600,13 +3610,7 @@ fn spawn_hermes_app() -> Result<(), String> {
   }
   #[cfg(not(target_os = "macos"))]
   {
-    Command::new(&install)
-      .stdin(Stdio::null())
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .spawn()
-      .map(|_| ())
-      .map_err(|e| format!("Impossibile avviare Hermes: {e}"))
+    desktop_spawn_app(&install, &[], "Hermes")
   }
 }
 
@@ -4765,6 +4769,8 @@ mod tests {
       assert_eq!(parsed["providers"]["requrv"]["name"], "ReQurv");
       assert_eq!(parsed["providers"]["requrv"]["api_key"], "requrv_sk_test");
       assert!(parsed["providers"]["requrv"]["models"].get("requrv-small-3.8").is_some());
+      // Il ragionamento è pinnato al livello minimo attivo: la CLI pensa meno.
+      assert_eq!(parsed["agent"]["reasoning_effort"], "minimal");
       assert_eq!(parsed["database"]["journal_mode"], "wal");
       assert_eq!(parsed["custom_providers"], serde_yaml::Value::Sequence(vec![]));
     }
@@ -4784,11 +4790,13 @@ mod tests {
   fn hermes_merge_preserves_model_options_and_other_providers_and_adds_missing_model() {
     let root = std::env::temp_dir().join(format!("requrv-hermes-merge-{}", std::process::id()));
     let path = root.join("config.yaml");
-    let raw = "database:\n  journal_mode: wal\nproviders:\n  openai: {name: OpenAI}\nmodel:\n  temperature: 0.25\n  extra: keep\n";
+    let raw = "database:\n  journal_mode: wal\nagent:\n  max_turns: 7\nproviders:\n  openai: {name: OpenAI}\nmodel:\n  temperature: 0.25\n  extra: keep\n";
     let merged = merge_hermes_provider(raw, "model with spaces:latest", "key: with spaces", &path).unwrap();
     let value: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
     assert_eq!(value["model"]["temperature"], 0.25);
     assert_eq!(value["model"]["extra"], "keep");
+    assert_eq!(value["agent"]["max_turns"], 7);
+    assert_eq!(value["agent"]["reasoning_effort"], "minimal");
     assert_eq!(value["model"]["default"], "model with spaces:latest");
     assert_eq!(value["providers"]["openai"]["name"], "OpenAI");
     assert_eq!(value["providers"]["requrv"]["api_key"], "key: with spaces");
