@@ -3529,6 +3529,92 @@ fn hermes_configured_in(home: &Path) -> bool {
   hermes_configured_at(&hermes_root_in(home))
 }
 
+// Hermes' pickers list its whole effort ladder (minimal…ultra), but the Hive
+// gateway only accepts low/medium/xhigh and answers 502 for the rest. The
+// sanctioned extension point is a user plugin under $HERMES_HOME/plugins, which
+// overrides the bundled "custom" provider by name: declaring the narrow set
+// makes Hermes' own clamp map every pick onto the nearest supported level
+// (minimal→low, high→medium, max/ultra→xhigh) instead of forwarding it.
+const HERMES_EFFORT_PLUGIN_MANIFEST: &str = "\
+name: requrv-effort-map
+kind: model-provider
+version: 1.0.0
+description: ReQurv Hive - mappa gli effort di Hermes sui livelli accettati dal gateway (low, medium, xhigh)
+author: ReQurv
+";
+
+const HERMES_EFFORT_PLUGIN: &str = r#""""ReQurv Hive: map the effort levels the gateway rejects onto the three it accepts.
+
+Hermes' pickers list the whole internal ladder (minimal, low, medium, high,
+xhigh, max, ultra), but the Hive gateway only supports low, medium and xhigh
+and answers 502 for anything else. This profile replaces the bundled ``custom``
+provider, so the shared clamp maps every pick onto the nearest supported level
+(minimal -> low, high -> medium, max/ultra -> xhigh) instead of forwarding it.
+"""
+
+from typing import Any
+
+from agent.reasoning_effort import clamp_effort
+from providers import register_provider
+from providers.base import ProviderProfile
+
+# "none" keeps "Disable reasoning" working; the rest is what the gateway accepts.
+SUPPORTED_EFFORTS = ("none", "low", "medium", "xhigh")
+
+
+class RequrvProfile(ProviderProfile):
+    """Custom-provider profile for AI Hive: narrow effort vocabulary, medium default."""
+
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
+        return SUPPORTED_EFFORTS
+
+    def default_reasoning_config(self, model: str | None = None) -> dict | None:
+        return {"enabled": True, "effort": "medium"}
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, ollama_num_ctx: int | None = None, **ctx: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        top_level: dict[str, Any] = {}
+        if isinstance(reasoning_config, dict):
+            effort = str(reasoning_config.get("effort") or "").strip().lower()
+            if effort == "none" or reasoning_config.get("enabled", True) is False:
+                top_level["reasoning_effort"] = "none"
+            elif effort:
+                top_level["reasoning_effort"] = clamp_effort(effort, SUPPORTED_EFFORTS)
+        return {}, top_level
+
+
+requrv = RequrvProfile(
+    # Same name as the bundled profile: user plugins win on collision.
+    name="custom",
+    aliases=("ollama", "local", "vllm", "llamacpp", "llama.cpp", "llama-cpp"),
+    env_vars=(),
+    base_url="",
+)
+
+register_provider(requrv)
+"#;
+
+fn hermes_effort_plugin_dir(home: &Path) -> PathBuf {
+  home.join("plugins").join("model-providers").join("requrv")
+}
+
+fn install_hermes_effort_plugin(home: &Path) -> Result<(), String> {
+  let dir = hermes_effort_plugin_dir(home);
+  std::fs::create_dir_all(&dir)
+    .map_err(|e| format!("Impossibile creare il plugin degli effort ({}): {e}", dir.display()))?;
+  std::fs::write(dir.join("__init__.py"), HERMES_EFFORT_PLUGIN)
+    .map_err(|e| format!("Impossibile scrivere il plugin degli effort: {e}"))?;
+  std::fs::write(dir.join("plugin.yaml"), HERMES_EFFORT_PLUGIN_MANIFEST)
+    .map_err(|e| format!("Impossibile scrivere il plugin degli effort: {e}"))?;
+  Ok(())
+}
+
+// Only our own plugin directory is touched: other user plugins stay untouched.
+fn remove_hermes_effort_plugin(home: &Path) {
+  let _ = std::fs::remove_dir_all(hermes_effort_plugin_dir(home));
+}
+
 // Back up (once, only while a file is not already ours) and rewrite each config
 // with the Hive provider and the selected model.
 fn write_hermes_config_at(root: &Path, model: &str, key: &str) -> Result<(), String> {
@@ -3552,6 +3638,12 @@ fn write_hermes_config_at(root: &Path, model: &str, key: &str) -> Result<(), Str
     std::fs::write(&path, updated)
       .map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
   }
+  // One plugin per home: the default config's directory and every profile's.
+  for path in hermes_config_paths_at(root) {
+    if let Some(home) = path.parent() {
+      install_hermes_effort_plugin(home)?;
+    }
+  }
   Ok(())
 }
 
@@ -3559,7 +3651,11 @@ fn write_hermes_config_path(path: &Path, model: &str, key: &str) -> Result<(), S
   let raw = std::fs::read_to_string(path)
     .map_err(|e| format!("Impossibile leggere {}: {e}", path.display()))?;
   let updated = merge_hermes_provider(&raw, model, key, path)?;
-  std::fs::write(path, updated).map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))
+  std::fs::write(path, updated).map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+  if let Some(home) = path.parent() {
+    install_hermes_effort_plugin(home)?;
+  }
+  Ok(())
 }
 
 fn write_hermes_config_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
@@ -3570,6 +3666,9 @@ fn write_hermes_config_in(home: &Path, model: &str, key: &str) -> Result<(), Str
 // rewrite, for the default home and every profile.
 fn restore_hermes_config_at(root: &Path) -> Result<(), String> {
   for path in hermes_config_paths_at(root) {
+    if let Some(home) = path.parent() {
+      remove_hermes_effort_plugin(home);
+    }
     let backup = backup_path_for(&path);
     if !backup.exists() {
       continue;
@@ -4776,12 +4875,21 @@ mod tests {
     }
     assert!(hermes_configured_at(&root));
 
+    // Il plugin che mappa gli effort viene scritto in ogni home (default e profili).
+    let plugin_dir = hermes_effort_plugin_dir(&root);
+    let profile_plugin_dir = hermes_effort_plugin_dir(&profile_dir);
+    assert!(plugin_dir.join("__init__.py").is_file());
+    assert!(plugin_dir.join("plugin.yaml").is_file());
+    assert!(profile_plugin_dir.join("__init__.py").is_file());
+
     // Il ripristino torna all'originale su ogni home e rimuove i backup.
     restore_hermes_config_at(&root).unwrap();
     for path in [&root_path, &profile_path] {
       assert_eq!(std::fs::read_to_string(path).unwrap(), original);
       assert!(!backup_path_for(path).exists());
     }
+    assert!(!plugin_dir.exists());
+    assert!(!profile_plugin_dir.exists());
     assert!(!hermes_configured_at(&root));
     let _ = std::fs::remove_dir_all(&root);
   }
@@ -4801,6 +4909,15 @@ mod tests {
     assert_eq!(value["providers"]["openai"]["name"], "OpenAI");
     assert_eq!(value["providers"]["requrv"]["api_key"], "key: with spaces");
     assert!(value["providers"]["requrv"]["models"].get("model with spaces:latest").is_some());
+  }
+
+  // Il plugin embedded deve dichiarare solo i livelli che il gateway accetta:
+  // il clamp di Hermes mappa lì tutti gli altri (max e ultra compresi).
+  #[test]
+  fn hermes_effort_plugin_declares_only_gateway_levels() {
+    assert!(HERMES_EFFORT_PLUGIN.contains(r#"SUPPORTED_EFFORTS = ("none", "low", "medium", "xhigh")"#));
+    assert!(HERMES_EFFORT_PLUGIN.contains("register_provider(requrv)"));
+    assert!(HERMES_EFFORT_PLUGIN.contains(r#"name="custom""#));
   }
 
   #[test]
