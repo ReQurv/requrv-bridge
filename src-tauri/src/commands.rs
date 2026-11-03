@@ -3,6 +3,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::Manager;
 
+// The app is a GUI binary with no console of its own, so on Windows every
+// console child started for detection (reg, cmd, powershell, tasklist, a
+// `--version` probe) would allocate and flash its own window: «Rileva» opened
+// and closed a burst of them. CREATE_NO_WINDOW keeps those helpers silent.
+// Interactive launches must NOT use this: they need a visible console.
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+  #[allow(unused_mut)]
+  let mut command = Command::new(program);
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+  }
+  command
+}
+
 // Local development override: a hive.env file in the app config dir may set
 // the HIVE_* base URLs (KEY=VALUE lines, '#' comments); real environment
 // variables win, and without the file the production defaults apply.
@@ -450,7 +466,7 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(target_os = "macos")]
 fn npm_via_login_shell() -> Option<PathBuf> {
   for shell in ["/bin/zsh", "/bin/bash"] {
-    let Ok(output) = Command::new(shell)
+    let Ok(output) = hidden_command(shell)
       .args(["-lic", "command -v npm"])
       .stdin(Stdio::null())
       .output()
@@ -482,15 +498,23 @@ fn npm_via_login_shell() -> Option<PathBuf> {
 
 // PATH of the current process can be stale (e.g. the app is launched from an
 // explorer that started before a PATH update), so on Windows we also read the
-// live PATH values from the registry and expand their %VARS%.
+// live PATH values from the registry and expand their %VARS%. Both hives are
+// needed: the machine PATH alone misses every per-user install (npm prefix,
+// bun, user-local shims), which is exactly where the CLIs usually land.
 #[cfg(windows)]
 fn registry_env() -> std::collections::HashMap<String, String> {
   let mut map = std::collections::HashMap::new();
-  for hive in [
-    "HKCU\\Environment",
+  let mut paths: [Option<String>; 2] = [None, None];
+  // Machine values first, then the user's: a user variable overrides the
+  // machine one with the same name, as it does in a real process environment.
+  for (index, hive) in [
     "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-  ] {
-    let Ok(output) = Command::new("reg").args(["query", hive]).output() else {
+    "HKCU\\Environment",
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let Ok(output) = hidden_command("reg").args(["query", hive]).output() else {
       continue;
     };
     let Ok(raw) = String::from_utf8(output.stdout) else {
@@ -508,12 +532,36 @@ fn registry_env() -> std::collections::HashMap<String, String> {
         continue;
       }
       let value = parts.collect::<Vec<_>>().join(" ");
-      if !value.is_empty() {
+      if value.is_empty() {
+        continue;
+      }
+      // PATH is composed, not overridden: keep the entries of both hives.
+      if name.eq_ignore_ascii_case("PATH") {
+        paths[index] = Some(value);
+      } else {
         map.insert(name.to_uppercase(), value);
       }
     }
   }
+  if let Some(path) = merged_registry_path(paths[0].as_deref(), paths[1].as_deref()) {
+    map.insert("PATH".to_string(), path);
+  }
   map
+}
+
+// A process PATH is the machine entries followed by the user's; joining the
+// two hives reproduces that order. Pure so the merge stays testable on hosts
+// without a registry.
+#[cfg(any(windows, test))]
+fn merged_registry_path(machine: Option<&str>, user: Option<&str>) -> Option<String> {
+  let mut parts: Vec<&str> = Vec::new();
+  for value in [machine, user].into_iter().flatten() {
+    let value = value.trim();
+    if !value.is_empty() {
+      parts.push(value);
+    }
+  }
+  (!parts.is_empty()).then(|| parts.join(";"))
 }
 
 #[cfg(windows)]
@@ -635,11 +683,11 @@ fn npm_global_dir() -> Option<PathBuf> {
   // would miss nvm/Homebrew installs otherwise.
   let npm = find_npm()?;
   let mut command = if cfg!(windows) {
-    let mut c = Command::new("cmd");
+    let mut c = hidden_command("cmd");
     c.arg("/c").arg(&npm);
     c
   } else {
-    Command::new(&npm)
+    hidden_command(&npm)
   };
   command.args(["config", "get", "prefix"]);
   let output = command.output().ok()?;
@@ -652,6 +700,31 @@ fn npm_global_dir() -> Option<PathBuf> {
     return None;
   }
   Some(PathBuf::from(line))
+}
+
+// Claude Code install locations that do not depend on PATH. The native
+// installer ships the binary in ~/.local/bin (claude.exe on Windows) and does
+// not add that directory to PATH, so a GUI-launched app — or simply a user
+// with an older PATH — would never see it. The npm shims are included too so
+// the ordering stays explicit; pure so it is testable off-device.
+fn claude_cli_candidates(home: &Path, appdata: Option<&Path>, windows: bool) -> Vec<PathBuf> {
+  let native = home.join(".local").join("bin");
+  let mut candidates: Vec<PathBuf> = if windows {
+    // .exe first: the extensionless npm shim is a bash script there.
+    vec![
+      native.join("claude.exe"),
+      native.join("claude.cmd"),
+    ]
+  } else {
+    vec![native.join("claude")]
+  };
+  // Checkout/legacy native install that keeps the binary under ~/.claude/local.
+  candidates.push(home.join(".claude").join("local").join("claude"));
+  if let Some(appdata) = appdata {
+    candidates.push(appdata.join("npm").join("claude.cmd"));
+    candidates.push(appdata.join("npm").join("claude.exe"));
+  }
+  candidates
 }
 
 fn find_service_binary(service: &str) -> Option<PathBuf> {
@@ -684,17 +757,11 @@ fn find_service_binary(service: &str) -> Option<PathBuf> {
       }
     }
     "claude" => {
-      if let Ok(appdata) = std::env::var("APPDATA") {
-        let appdata = PathBuf::from(appdata);
-        vec![
-          appdata.join("npm").join("claude.cmd"),
-          appdata.join("npm").join("claude.exe"),
-        ]
-      } else {
-        // npm global installs fall through to the nvm/npm-prefix fallbacks
-        // below; the native installer puts the binary in ~/.local/bin.
-        vec![home.join(".local").join("bin").join("claude")]
-      }
+      // npm global installs fall through to the nvm/npm-prefix fallbacks
+      // below; the native installer puts the binary in ~/.local/bin, which it
+      // does not add to PATH on Windows.
+      let appdata = std::env::var("APPDATA").ok().map(PathBuf::from);
+      claude_cli_candidates(&home, appdata.as_deref(), cfg!(windows))
     }
     _ => return None,
   };
@@ -774,16 +841,29 @@ fn app_bundle_path_in(candidates: &[PathBuf]) -> Option<PathBuf> {
 // repeating the tasklist/pgrep details. Each helper is compiled only on its
 // own platform; macOS never sees them.
 
+// Command for a detached desktop app, with the environment quirks that would
+// turn an Electron GUI into a stub removed. When the bridge is itself started
+// from an Electron host (VS Code's terminal, an editor-managed harness) the
+// inherited ELECTRON_RUN_AS_NODE=1 makes the child's main process run as plain
+// Node: it exits at once and no window appears. Pure so the removal stays
+// testable without spawning anything.
+#[cfg(any(windows, target_os = "linux"))]
+fn desktop_app_command(bin: &Path, env: &[(&str, &str)]) -> Command {
+  let mut command = Command::new(bin);
+  command.env_remove("ELECTRON_RUN_AS_NODE");
+  for (name, value) in env {
+    command.env(name, value);
+  }
+  command
+}
+
 // Launch a desktop app executable detached. The cross-platform sibling of
 // `open_app_bundle` (macOS): stdio is nulled so the child outlives this call.
 // No CREATE_NEW_CONSOLE here, unlike `spawn_cli`, because these are GUI
 // (windows-subsystem) apps that own their window rather than a console.
 #[cfg(any(windows, target_os = "linux"))]
 fn desktop_spawn_app(bin: &Path, env: &[(&str, &str)], label: &str) -> Result<(), String> {
-  let mut command = Command::new(bin);
-  for (name, value) in env {
-    command.env(name, value);
-  }
+  let mut command = desktop_app_command(bin, env);
   command
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -798,7 +878,7 @@ fn desktop_spawn_app(bin: &Path, env: &[(&str, &str)], label: &str) -> Result<()
 #[cfg(windows)]
 fn desktop_process_running(names: &[&str]) -> bool {
   for name in names {
-    let Ok(output) = Command::new("tasklist")
+    let Ok(output) = hidden_command("tasklist")
       .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
@@ -820,7 +900,7 @@ fn desktop_process_running(names: &[&str]) -> bool {
 #[cfg(target_os = "linux")]
 fn desktop_process_running(names: &[&str]) -> bool {
   for name in names {
-    let running = Command::new("pgrep")
+    let running = hidden_command("pgrep")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -840,7 +920,7 @@ fn desktop_process_running(names: &[&str]) -> bool {
 #[cfg(windows)]
 fn desktop_process_quit(names: &[&str]) {
   for name in names {
-    Command::new("taskkill")
+    hidden_command("taskkill")
       .args(["/F", "/IM", name])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -853,7 +933,7 @@ fn desktop_process_quit(names: &[&str]) {
 #[cfg(target_os = "linux")]
 fn desktop_process_quit(names: &[&str]) {
   for name in names {
-    Command::new("pkill")
+    hidden_command("pkill")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -932,13 +1012,20 @@ fn opencode_app_path() -> Option<PathBuf> {
 }
 
 // Pure candidate search so the layout matching stays testable on any host.
-// The current per-user installer lays the app under the npm-scope directory
-// "@opencode-aidesktop"; the bare vendor names cover older layouts.
+// The current per-user installer lays the app under the reverse-DNS directory
+// "ai.opencode.desktop" (verified on a real Windows device); the npm-scope
+// "@opencode-aidesktop" and the bare vendor names cover older layouts.
 #[cfg(any(windows, test))]
 fn opencode_app_path_in(roots: &[PathBuf]) -> Option<PathBuf> {
   let mut candidates: Vec<PathBuf> = Vec::new();
   for root in roots {
-    for dir in ["OpenCode", "opencode", "OpenCode Desktop", "@opencode-aidesktop"] {
+    for dir in [
+      "ai.opencode.desktop",
+      "OpenCode",
+      "opencode",
+      "OpenCode Desktop",
+      "@opencode-aidesktop",
+    ] {
       for exe in ["OpenCode.exe", "opencode-desktop.exe", "OpenCode Desktop.exe"] {
         candidates.push(root.join(dir).join(exe));
       }
@@ -1001,7 +1088,7 @@ fn chatgpt_app_bundle() -> Option<PathBuf> {
 // from Get-AppxPackage, the in-package executable path from the manifest.
 #[cfg(windows)]
 fn appx_package_full_name(name_pattern: &str) -> Option<String> {
-  let output = Command::new("powershell")
+  let output = hidden_command("powershell")
     .args([
       "-NoProfile",
       "-NonInteractive",
@@ -1537,7 +1624,7 @@ fn write_opencode_config(model: &str, key: &str) -> Result<(), String> {
 // environment to the app, so `env` pins the variables the app must see.
 #[cfg(target_os = "macos")]
 fn open_app_bundle(bundle: &Path, label: &str, env: &[(&str, &str)]) -> Result<(), String> {
-  let mut command = Command::new("open");
+  let mut command = hidden_command("open");
   command.arg(bundle);
   for (name, value) in env {
     command.env(name, value);
@@ -1564,7 +1651,7 @@ fn hive_codex_home() -> Option<PathBuf> {
 // the bundle executable is "OpenCode", so the lowercase CLI is not matched.
 #[cfg(target_os = "macos")]
 fn opencode_app_running() -> bool {
-  Command::new("pgrep")
+  hidden_command("pgrep")
     .args(["-x", "OpenCode"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -1637,7 +1724,7 @@ fn quit_and_reopen_opencode() -> Result<(), String> {
   let bundle = opencode_app_path()
     .ok_or_else(|| String::from("OpenCode.app non trovato in /Applications: installalo e riprova."))?;
   if opencode_app_running() {
-    Command::new("pkill")
+    hidden_command("pkill")
       .args(["-x", "OpenCode"])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -1787,7 +1874,7 @@ fn codex_version_ok(version: &str) -> bool {
 }
 
 fn check_codex_version(bin: &Path) -> Result<(), String> {
-  let output = Command::new(bin)
+  let output = hidden_command(bin)
     .arg("--version")
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -2159,7 +2246,7 @@ fn restore_chatgpt_app_in(home: &Path, key: &str) -> Result<(), String> {
 // models until it is restarted.
 #[cfg(target_os = "macos")]
 fn chatgpt_app_running() -> bool {
-  Command::new("pgrep")
+  hidden_command("pgrep")
     .args(["-x", "ChatGPT"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2191,7 +2278,7 @@ fn quit_and_reopen_chatgpt() -> Result<(), String> {
   let bundle = chatgpt_app_bundle()
     .ok_or_else(|| String::from("ChatGPT.app non trovato in /Applications: installalo e riprova."))?;
   if chatgpt_app_running() {
-    Command::new("osascript")
+    hidden_command("osascript")
       .args(["-e", "tell application \"ChatGPT\" to quit"])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -2207,7 +2294,7 @@ fn quit_and_reopen_chatgpt() -> Result<(), String> {
       std::thread::sleep(std::time::Duration::from_millis(500));
     }
     if chatgpt_app_running() {
-      Command::new("pkill")
+      hidden_command("pkill")
         .args(["-x", "ChatGPT"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2655,7 +2742,7 @@ async fn assert_claude_gateway_available(key: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn claude_desktop_running() -> bool {
-  Command::new("pgrep")
+  hidden_command("pgrep")
     .args(["-f", "Claude.app/Contents/MacOS/Claude"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2680,7 +2767,7 @@ fn claude_desktop_running() -> bool {
 
 #[cfg(target_os = "macos")]
 fn quit_claude_desktop() {
-  Command::new("osascript")
+  hidden_command("osascript")
     .args(["-e", "tell application \"Claude\" to quit"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2693,7 +2780,7 @@ fn quit_claude_desktop() {
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
   }
-  Command::new("pkill")
+  hidden_command("pkill")
     .args(["-f", "Claude.app/Contents/MacOS/Claude"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -3121,7 +3208,7 @@ fn is_setup_bundle_id(identifier: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_setup_bundle(bundle: &Path) -> bool {
-  let Ok(output) = Command::new("plutil")
+  let Ok(output) = hidden_command("plutil")
     .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
     .arg(bundle.join("Contents").join("Info.plist"))
     .stdin(Stdio::null())
@@ -3223,7 +3310,7 @@ fn hermes_cli_path() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 fn hermes_app_running() -> bool {
   for name in ["Hermes", "HERMES-IDE", "hermes-ide"] {
-    let running = Command::new("pgrep")
+    let running = hidden_command("pgrep")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -3497,7 +3584,7 @@ fn quit_hermes_app() -> Result<(), String> {
   let app_name = hermes_app_path()
     .and_then(|b| b.file_stem().map(|s| s.to_string_lossy().to_string()))
     .unwrap_or_else(|| String::from("HERMES-IDE"));
-  let _ = Command::new("osascript")
+  let _ = hidden_command("osascript")
     .args(["-e", &format!("tell application \"{app_name}\" to quit")])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -3510,7 +3597,7 @@ fn quit_hermes_app() -> Result<(), String> {
     std::thread::sleep(std::time::Duration::from_millis(500));
   }
   for name in ["Hermes", "HERMES-IDE", "hermes-ide"] {
-    let _ = Command::new("pkill")
+    let _ = hidden_command("pkill")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -3660,7 +3747,7 @@ fn open_terminal_script(app: &tauri::AppHandle, service: &str, script: &str) -> 
     "tell application \"Terminal\"\n  activate\n  do script \"bash {}\"\nend tell\n",
     applescript_escape(&shell_quote(&path.to_string_lossy())),
   );
-  let mut child = Command::new("osascript")
+  let mut child = hidden_command("osascript")
     .stdin(Stdio::piped())
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -3695,7 +3782,7 @@ fn spawn_cli(
   env: &[(&str, &str)],
   working_directory: &Path,
 ) -> Result<(), String> {
-  Command::new(bin)
+  hidden_command(bin)
     .current_dir(working_directory)
     .args(args)
     .envs(env.iter().copied())
@@ -4155,7 +4242,8 @@ mod tests {
   }
 
   // L'installer Windows attuale pone l'app nella directory a scope npm
-  // "@opencode-aidesktop": la ricerca deve risolversi anche con quel layout.
+  // "@opencode-aidesktop", il più recente nella directory reverse-DNS
+  // "ai.opencode.desktop": la ricerca deve risolversi con entrambi i layout.
   #[test]
   fn opencode_app_path_in_finds_scoped_installer_dir() {
     let tmp =
@@ -4169,6 +4257,76 @@ mod tests {
     // Una root senza installazione non deve risolversi a nulla.
     assert_eq!(opencode_app_path_in(&[tmp.join("vuoto")]), None);
     let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // L'installer per-utente verificato su Windows usa il nome reverse-DNS
+  // "ai.opencode.desktop" sotto %LOCALAPPDATA%\Programs.
+  #[test]
+  fn opencode_app_path_in_finds_reverse_dns_installer_dir() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-bridge-test-opencode-dns-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let dns = tmp.join("ai.opencode.desktop");
+    std::fs::create_dir_all(&dns).unwrap();
+    std::fs::write(dns.join("OpenCode.exe"), "stub").unwrap();
+    assert_eq!(opencode_app_path_in(&[tmp.clone()]), Some(dns.join("OpenCode.exe")));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Un bridge avviato da un host Electron (terminale di VS Code, harness)
+  // eredita ELECTRON_RUN_AS_NODE=1: il figlio Electron partirebbe come Node ed
+  // uscirebbe senza finestra, quindi lo spawn deve rimuovere la variabile.
+  #[cfg(any(windows, target_os = "linux"))]
+  #[test]
+  fn desktop_app_spawn_drops_electron_node_mode() {
+    let command = desktop_app_command(Path::new("OpenCode.exe"), &[("HIVE_MODEL", "requrv-small-3.8")]);
+    let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = command
+      .get_envs()
+      .map(|(name, value)| (name.to_owned(), value.map(|value| value.to_owned())))
+      .collect();
+    assert!(envs
+      .iter()
+      .any(|(name, value)| name == "ELECTRON_RUN_AS_NODE" && value.is_none()));
+    assert!(envs.iter().any(|(name, value)| name == "HIVE_MODEL"
+      && value.as_deref() == Some(std::ffi::OsStr::new("requrv-small-3.8"))));
+  }
+
+  // Il PATH di un processo avviato da Explorer può essere vecchio o ridotto:
+  // entrambi gli hive vanno uniti, macchina prima e utente dopo, altrimenti
+  // spariscono le installazioni per-utente (prefisso npm, bun, shim locali).
+  #[test]
+  fn merged_registry_path_keeps_machine_and_user_entries() {
+    assert_eq!(
+      merged_registry_path(Some("C:\\Windows\\system32"), Some("C:\\Users\\u\\AppData\\Roaming\\npm")),
+      Some("C:\\Windows\\system32;C:\\Users\\u\\AppData\\Roaming\\npm".to_string())
+    );
+    assert_eq!(
+      merged_registry_path(None, Some(" C:\\Users\\u\\.bun\\bin ")),
+      Some("C:\\Users\\u\\.bun\\bin".to_string())
+    );
+    assert_eq!(
+      merged_registry_path(Some("C:\\Windows"), None),
+      Some("C:\\Windows".to_string())
+    );
+    assert_eq!(merged_registry_path(None, None), None);
+    assert_eq!(merged_registry_path(Some("  "), Some("")), None);
+  }
+
+  // Sonda manuale: stampa ciò che «Rileva» vede sulla macchina corrente. È
+  // ignorata perché dipende dall'installazione reale, non dalla logica.
+  #[test]
+  #[ignore]
+  fn detection_probe_real_machine() {
+    println!("{}", serde_json::to_string_pretty(&check_services()).unwrap());
+    for service in ["opencode", "codex", "claude", "hermes"] {
+      println!("{service}: {:?}", find_service_binary(service));
+    }
+    println!("opencode app: {:?}", opencode_app_path());
+    println!("chatgpt app: {:?}", chatgpt_app_bundle());
+    println!("claude desktop app: {:?}", claude_desktop_app_path());
+    println!("hermes app: {:?}", hermes_app_path());
+    println!("hermes cli: {:?}", hermes_cli_path());
+    println!("codex app binary: {:?}", codex_app_binary());
   }
 
   // Nel manifest il contenitore <Applications> va saltato e gli attributi
@@ -4717,11 +4875,41 @@ mod tests {
     }
   }
 
+  // L'installer nativo di Claude Code non tocca il PATH: su Windows lascia
+  // claude.exe in %USERPROFILE%\.local\bin, quindi la sola ricerca sul PATH
+  // dichiarerebbe la CLI assente. La lista dei candidati deve coprirlo.
+  #[test]
+  fn claude_candidates_cover_native_install_and_npm_shims() {
+    let home = Path::new("/home/u");
+    let native = home.join(".local").join("bin");
+    let appdata = Path::new("/home/u/AppData/Roaming");
+
+    let windows = claude_cli_candidates(home, Some(appdata), true);
+    assert_eq!(windows.first(), Some(&native.join("claude.exe")));
+    assert!(windows.contains(&native.join("claude.cmd")));
+    assert!(windows.contains(&appdata.join("npm").join("claude.cmd")));
+    assert!(windows.contains(&appdata.join("npm").join("claude.exe")));
+    // Lo shim senza estensione è uno script bash su Windows: non va proposto
+    // come eseguibile, altrimenti il lancio fallirebbe dopo il rilevamento.
+    assert!(!windows.contains(&native.join("claude")));
+
+    let posix = claude_cli_candidates(home, None, false);
+    assert_eq!(posix.first(), Some(&native.join("claude")));
+    assert!(!posix.contains(&native.join("claude.exe")));
+  }
+
   // Simula un processo con PATH vecchio/stripped (es. app lanciata da un
   // explorer partito prima dell'aggiornamento PATH): su Windows la
   // rilevazione deve comunque funzionare leggendo il PATH dal registry.
   #[test]
   fn finds_opencode_with_stale_path() {
+    // Serve un'installazione reale di opencode da trovare: senza, il fallback
+    // non ha nulla da risolvere e il test misurerebbe solo la macchina. Dove la
+    // CLI c'è (le immagini CI la includono) l'asserzione resta attiva.
+    if find_service_binary("opencode").is_none() {
+      println!("opencode non installato: verifica del PATH dal registry saltata");
+      return;
+    }
     let original = std::env::var("PATH").unwrap_or_default();
     std::env::set_var(
       "PATH",
@@ -5814,9 +6002,11 @@ mod tests {
   #[test]
   fn mcp_claude_desktop_roundtrip() {
     let home = mcp_test_home();
-    let support = application_support_root(&home);
-    std::fs::create_dir_all(support.join("Claude")).unwrap();
-    let path = support.join("Claude/claude_desktop_config.json");
+    // Claude Desktop keeps its config under %LOCALAPPDATA% on Windows and under
+    // the app-support root elsewhere: ask the product resolver instead of
+    // assuming one layout, otherwise the fixture and the write target diverge.
+    let path = claude_desktop_paths_in(&home).normal_config;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, r#"{"deploymentMode":"1p"}"#).unwrap();
 
     write_mcp_target_in(&home, "claude_desktop", &mcp_server_fixture()).unwrap();

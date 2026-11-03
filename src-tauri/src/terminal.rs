@@ -59,7 +59,7 @@ pub(crate) fn build_windows_script(
     "$ErrorActionPreference = 'Stop'\n$exitCode = 1\ntry {\n  Set-Location -LiteralPath ",
   );
   out.push_str(&ps_quote(&windows_shell_path(working_directory)));
-  out.push_str("\n");
+  out.push('\n');
   for (name, value) in env {
     out.push_str("  [Environment]::SetEnvironmentVariable(");
     out.push_str(&ps_quote(name));

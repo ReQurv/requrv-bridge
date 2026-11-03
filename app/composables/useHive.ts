@@ -142,7 +142,7 @@ export const SERVICE_GROUPS: ServiceGroup[] = [
         kind: 'cli',
         name: 'OpenCode CLI',
         installCommand: 'curl -fsSL https://opencode.ai/install | bash',
-        windowsInstallCommand: 'npm install -g opencode-ai',
+        windowsInstallCommand: 'npm install -g @opencode/cli',
         installDocsUrl: 'https://opencode.ai/docs/'
       }
     ]
