@@ -3248,10 +3248,27 @@ fn hermes_app_path() -> Option<PathBuf> {
     .or_else(|| hermes_repo_app_path_in(&hermes_root_in(&home)))
 }
 
+// Windows counterpart of the macOS checkout fallback: the same build tree lays
+// the desktop app out as release/<arch>/win-unpacked/Hermes.exe, so the release
+// directories are scanned one level down. Pure so it stays testable off-device.
+#[cfg(any(windows, test))]
+fn hermes_checkout_app_path_in(root: &Path) -> Option<PathBuf> {
+  let release = root.join("hermes-agent").join("apps").join("desktop").join("release");
+  let mut found: Vec<PathBuf> = std::fs::read_dir(release)
+    .ok()?
+    .flatten()
+    .map(|entry| entry.path().join("Hermes.exe"))
+    .filter(|exe| exe.is_file())
+    .collect();
+  found.sort();
+  found.into_iter().next()
+}
+
 // Windows: the desktop app is the GUI build (Hermes.exe), a separate surface
 // from the CLI, which is launched through hermes_cli_path — so `hermes` on PATH
 // is deliberately not a candidate here. The NSIS installer lays the app out
-// under %LOCALAPPDATA%\Programs; the HERMES-IDE spellings cover the older name.
+// under %LOCALAPPDATA%\Programs; the HERMES-IDE spellings cover the older name,
+// and the "git" installer builds the app in place under the checkout instead.
 #[cfg(windows)]
 fn hermes_app_path() -> Option<PathBuf> {
   let Ok(local) = std::env::var("LOCALAPPDATA") else {
@@ -3266,7 +3283,12 @@ fn hermes_app_path() -> Option<PathBuf> {
       }
     }
   }
-  None
+  let mut roots: Vec<PathBuf> = Vec::new();
+  if let Ok(home) = std::env::var("HERMES_HOME") {
+    roots.push(PathBuf::from(home));
+  }
+  roots.push(Path::new(&local).join("hermes"));
+  roots.into_iter().find_map(|root| hermes_checkout_app_path_in(&root))
 }
 
 #[cfg(target_os = "linux")]
@@ -3276,14 +3298,27 @@ fn hermes_app_path() -> Option<PathBuf> {
   None
 }
 
+// Windows launchers: the packaged installer exposes the venv entry point, while
+// the "git" installer writes a bin/hermes.exe shim next to the checkout. Both
+// forms are proposed, so whichever the install method produced gets detected.
+#[cfg(any(windows, test))]
+fn hermes_windows_cli_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
+  let mut candidates = Vec::new();
+  for root in roots {
+    candidates.push(root.join("hermes-agent").join("venv").join("Scripts").join("hermes.exe"));
+    candidates.push(root.join("bin").join("hermes.exe"));
+  }
+  candidates
+}
+
 // The Hermes CLI launcher: `hermes` on PATH, or the wrapper install.sh writes
-// to ~/.local/bin on POSIX. Windows installs the checkout under
-// %HERMES_HOME%/%LOCALAPPDATA%[\hermes] and exposes hermes.exe in its venv.
+// to ~/.local/bin on POSIX, or the Windows checkout's bin/ shim.
 fn hermes_cli_path() -> Option<PathBuf> {
   if let Some(bin) = find_on_path("hermes") {
     return Some(bin);
   }
-  if cfg!(windows) {
+  #[cfg(windows)]
+  {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("HERMES_HOME") {
       roots.push(PathBuf::from(home));
@@ -3292,16 +3327,15 @@ fn hermes_cli_path() -> Option<PathBuf> {
       roots.push(PathBuf::from(&local));
       roots.push(PathBuf::from(local).join("hermes"));
     }
-    for root in roots {
-      let candidate = root.join("hermes-agent").join("venv").join("Scripts").join("hermes.exe");
-      if candidate.is_file() {
-        return Some(candidate);
-      }
-    }
-    return None;
+    hermes_windows_cli_candidates(&roots)
+      .into_iter()
+      .find(|candidate| candidate.is_file())
   }
-  let fallback = home_dir()?.join(".local").join("bin").join("hermes");
-  fallback.is_file().then_some(fallback)
+  #[cfg(not(windows))]
+  {
+    let fallback = home_dir()?.join(".local").join("bin").join("hermes");
+    fallback.is_file().then_some(fallback)
+  }
 }
 
 // True when the Hermes desktop app is live. The macOS bundle ships the app as
@@ -4842,6 +4876,45 @@ mod tests {
     assert_eq!(hermes_repo_app_path_in(&tmp), Some(bundle));
     assert_eq!(hermes_repo_app_path_in(&tmp.join("vuoto")), None);
     let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Su Windows lo stesso checkout produce release/win-unpacked/Hermes.exe: è
+  // l'installazione "git", che non passa da %LOCALAPPDATA%\Programs.
+  #[test]
+  fn finds_hermes_app_in_the_checkout_win_unpacked() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-bridge-test-hermes-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let unpacked = tmp
+      .join("hermes-agent")
+      .join("apps")
+      .join("desktop")
+      .join("release")
+      .join("win-unpacked");
+    std::fs::create_dir_all(&unpacked).expect("create fake win-unpacked");
+    std::fs::write(unpacked.join("Hermes.exe"), "stub").expect("write fake exe");
+    assert_eq!(
+      hermes_checkout_app_path_in(&tmp),
+      Some(unpacked.join("Hermes.exe"))
+    );
+    assert_eq!(hermes_checkout_app_path_in(&tmp.join("vuoto")), None);
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // La CLI del checkout vive in bin/, quella dell'installer pacchettizzato nel
+  // venv: entrambe le forme devono comparire tra i candidati.
+  #[test]
+  fn hermes_windows_cli_candidates_cover_bin_and_venv() {
+    let root = Path::new("C:\\Users\\u\\AppData\\Local\\hermes");
+    let candidates = hermes_windows_cli_candidates(&[root.to_path_buf()]);
+    assert!(candidates.contains(&root.join("bin").join("hermes.exe")));
+    assert!(candidates.contains(
+      &root
+        .join("hermes-agent")
+        .join("venv")
+        .join("Scripts")
+        .join("hermes.exe")
+    ));
   }
 
   // Il gateway risponde 422 al POST di prova con corpo vuoto (validazione del
