@@ -11,6 +11,7 @@ const VENDOR_LOGOS: Record<string, Component> = { HermesLogo }
 
 const hive = useHive()
 const { keySaved, selectedModel, status, launching, restoring, projectDirectory } = hive
+const busy = computed(() => hive.saving.value || !!launching.value || restoring.value || hive.restarting.value || hive.restartModalOpen.value)
 
 const rows = computed(() =>
   props.group.surfaces.filter(isSurfaceAvailable).map(surface => ({
@@ -43,11 +44,22 @@ async function copyInstallCommand() {
   }
 }
 const restoreTarget = ref<ServiceSurface | null>(null)
-const restoreBody = computed(() =>
-  restoreTarget.value?.service === 'claude_desktop'
-    ? 'Vengono recuperati i profili pre-Hive e Claude Desktop tornerà a usare l\'account Claude. Il modello Hive sparirà dal picker.'
-    : 'Vengono recuperati config.toml e auth.json pre-Hive e ChatGPT tornerà a usare l\'account OpenAI.'
-)
+const restoreBody = computed(() => {
+  const service = restoreTarget.value?.service
+  if (service === 'claude_desktop') {
+    return 'Vengono ripristinati i profili e i file originali salvati prima della configurazione AI Hive. Claude Desktop tornerà alla configurazione precedente.'
+  }
+  if (service === 'claude_code') {
+    return 'Viene ripristinato il file settings.json originale salvato prima della configurazione AI Hive.'
+  }
+  if (service === 'opencode') {
+    return 'Viene ripristinato il file opencode.jsonc originale salvato prima della configurazione AI Hive, condiviso da OpenCode app e CLI.'
+  }
+  if (service === 'codex') {
+    return 'Vengono ripristinati i file originali di ~/.codex salvati prima della configurazione AI Hive, condivisi da ChatGPT app e Codex CLI.'
+  }
+  return 'Vengono ripristinati i file config.yaml originali salvati prima della configurazione AI Hive, inclusi quelli dei profili Hermes.'
+})
 </script>
 
 <template>
@@ -97,7 +109,7 @@ const restoreBody = computed(() =>
             :icon="row.launchIcon"
             size="sm"
             :loading="launching === row.key"
-            :disabled="!ready"
+            :disabled="!ready || busy || !!restoreTarget"
             @click="hive.launch(row.surface)"
           />
           <UButton
@@ -126,6 +138,7 @@ const restoreBody = computed(() =>
             color="neutral"
             variant="ghost"
             :loading="restoring"
+            :disabled="busy || !!restoreTarget"
             :aria-label="`Ripristina ${row.surface.name}`"
             @click="restoreTarget = row.surface"
           />
@@ -153,12 +166,14 @@ const restoreBody = computed(() =>
           label="Annulla"
           color="neutral"
           variant="ghost"
+          :disabled="restoring"
           @click="restoreTarget = null"
         />
         <UButton
           icon="i-lucide-rotate-ccw"
           label="Ripristina"
           :loading="restoring"
+          :disabled="busy"
           @click="hive.restoreApp(restoreTarget!.service); restoreTarget = null"
         />
       </div>

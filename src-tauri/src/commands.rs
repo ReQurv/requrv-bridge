@@ -3,6 +3,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::Manager;
 
+// The app is a GUI binary with no console of its own, so on Windows every
+// console child started for detection (reg, cmd, powershell, tasklist, a
+// `--version` probe) would allocate and flash its own window: «Rileva» opened
+// and closed a burst of them. CREATE_NO_WINDOW keeps those helpers silent.
+// Interactive launches must NOT use this: they need a visible console.
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+  #[allow(unused_mut)]
+  let mut command = Command::new(program);
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+  }
+  command
+}
+
 // Local development override: a hive.env file in the app config dir may set
 // the HIVE_* base URLs (KEY=VALUE lines, '#' comments); real environment
 // variables win, and without the file the production defaults apply.
@@ -89,15 +105,15 @@ pub async fn set_hive_key(app: tauri::AppHandle, key: String, model: String) -> 
   if key.is_empty() {
     return Err("La chiave non può essere vuota".into());
   }
+  // Verify the replacement credential before persisting it or rotating any
+  // already configured harness files.
+  let models = list_hive_models(key.to_string()).await?;
+  let model = verified_hive_model(model, &models)
+    .ok_or_else(|| "AI Hive non ha restituito modelli di testo utilizzabili".to_string())?;
   let path = key_file_path(&app)?;
-  write_key_file(&path, key, model)?;
-  // The catalog (context window, modalities, reasoning levels) is only needed
-  // by the Codex config, so it is fetched once, here, when one exists.
+  write_key_file(&path, key, &model)?;
   let failures = match home_dir() {
-    Some(home) if !model.is_empty() => {
-      let models = list_hive_models(key.to_string()).await.unwrap_or_default();
-      reapply_persisted_configs(&home, model, key, &models)
-    }
+    Some(home) => reapply_persisted_configs(&home, &model, key, &models),
     _ => Vec::new(),
   };
   if !failures.is_empty() {
@@ -113,8 +129,11 @@ fn write_key_file(path: &Path, key: &str, model: &str) -> Result<(), String> {
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
   }
-  if let Ok(old) = std::fs::read_to_string(path) {
-    let _ = std::fs::write(path.with_extension("json.bak"), old);
+  match std::fs::read_to_string(path) {
+    Ok(old) => std::fs::write(path.with_extension("json.bak"), old)
+      .map_err(|e| format!("Backup della chiave non riuscito: {e}"))?,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    Err(e) => return Err(format!("Impossibile leggere la chiave salvata: {e}")),
   }
   let value = serde_json::json!({ "apiKey": key, "model": model });
   std::fs::write(path, value.to_string()).map_err(|e| e.to_string())
@@ -139,11 +158,21 @@ pub fn delete_hive_key(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 // A key change must reach every file this launcher already wrote, or the key
-// on disk silently diverges from the one in the app. Only the targets that
-// persist something are touched (Hermes is env-only). Returns the failures so
+// on disk silently diverges from the one in the app. Only managed targets are
+// touched. Returns the failures so
 // the caller reports them instead of leaving a half-applied key behind.
 fn reapply_persisted_configs(
   home: &Path,
+  model: &str,
+  key: &str,
+  models: &[HiveModel],
+) -> Vec<String> {
+  reapply_persisted_configs_at(home, &hermes_root_in(home), model, key, models)
+}
+
+fn reapply_persisted_configs_at(
+  home: &Path,
+  hermes_root: &Path,
   model: &str,
   key: &str,
   models: &[HiveModel],
@@ -167,6 +196,18 @@ fn reapply_persisted_configs(
       failures.push(format!("Codex: {e}"));
     }
   }
+  if claude_desktop_configured_in(home) {
+    if let Err(e) = reapply_claude_desktop_in(home, model, key) {
+      failures.push(format!("Claude Desktop: {e}"));
+    }
+  }
+  for path in hermes_config_paths_at(hermes_root) {
+    if hermes_config_has_provider(&path) {
+      if let Err(e) = write_hermes_config_path(&path, model, key) {
+        failures.push(format!("Hermes ({}): {e}", path.display()));
+      }
+    }
+  }
   failures
 }
 
@@ -174,6 +215,23 @@ fn reapply_persisted_configs(
 pub struct HiveModel {
   pub id: String,
   pub model_type: String,
+}
+
+fn verified_hive_model(requested: &str, models: &[HiveModel]) -> Option<String> {
+  let text_models: Vec<&HiveModel> = models.iter().filter(|m| m.model_type == "TEXT_GENERATION").collect();
+  let usable: Vec<&HiveModel> = if !text_models.is_empty() {
+    text_models
+  } else if models.iter().all(|m| m.model_type.trim().is_empty()) {
+    models.iter().collect()
+  } else {
+    return None;
+  };
+  usable
+    .iter()
+    .copied()
+    .find(|m| m.id == requested)
+    .or_else(|| usable.first().copied())
+    .map(|m| m.id.clone())
 }
 
 #[tauri::command]
@@ -223,37 +281,47 @@ pub async fn list_hive_models(key: String) -> Result<Vec<HiveModel>, String> {
   Ok(models)
 }
 
-// Error for a gateway probe status, if any. 4xx from the handler (422
-// validation on the empty body, 401, 405, ...) prove the route exists, so
-// only 404 (route missing) and 5xx (gateway failure) are errors.
+// An empty-body probe proves route availability, not complete model/tool
+// compatibility. Auth, throttling and unsupported methods must still fail.
 fn probe_error(status: reqwest::StatusCode, agent: &str, endpoint: &str) -> Option<String> {
-  if status == reqwest::StatusCode::NOT_FOUND {
-    Some(format!(
-      "{agent} richiede l'endpoint {endpoint}, che AI Hive non espone (HTTP 404). Riprova più tardi."
-    ))
-  } else if status.is_server_error() {
-    Some(format!("AI Hive ha risposto con lo stato {status}"))
-  } else {
-    None
+  if status.is_success() || matches!(status.as_u16(), 400 | 422) {
+    return None;
   }
+  let reason = match status.as_u16() {
+    401 | 403 => "Chiave Hive rifiutata",
+    404 => "Endpoint non disponibile",
+    405 => "Metodo POST non supportato",
+    429 => "Limite di richieste raggiunto, riprova più tardi",
+    _ => "Risposta inattesa dal gateway",
+  };
+  Some(format!("{agent}: {reason} su {endpoint} (HTTP {status})."))
 }
 
-// POST an empty body to the gateway endpoint the agent needs. `base` is the
-// same base URL the agent's own client will use, so the probe proves the route
-// on the host the session will really hit (the OpenAI and Anthropic gateways
-// are separate hosts/proxies and only one of them may expose a given path).
-// A 4xx from the handler (e.g. 422 validation on the empty body) proves the
-// route exists without invoking a model; only 404 and 5xx are errors. Probing
-// before opening a session fails fast with an actionable message instead of a
-// broken TUI.
-async fn assert_endpoint_available(base: &str, key: &str, endpoint: &str, agent: &str) -> Result<(), String> {
-  let client = reqwest::Client::new();
-  let url = format!("{base}{endpoint}");
-  let response = client
-    .post(&url)
-    .bearer_auth(key.trim())
+fn endpoint_probe_request(
+  client: &reqwest::Client,
+  base: &str,
+  key: &str,
+  endpoint: &str,
+) -> reqwest::RequestBuilder {
+  let request = client.post(format!("{}{endpoint}", base.trim_end_matches('/')));
+  let request = if endpoint == "/v1/messages" {
+    request.header("x-api-key", key.trim()).header("anthropic-version", "2023-06-01")
+  } else {
+    request.bearer_auth(key.trim())
+  };
+  request
     .json(&serde_json::json!({}))
     .timeout(std::time::Duration::from_secs(10))
+}
+
+// Use each client's own auth scheme without generating billable model output.
+// Redirects are errors: an HTML login page is not the requested API endpoint.
+async fn assert_endpoint_available(base: &str, key: &str, endpoint: &str, agent: &str) -> Result<(), String> {
+  let client = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .build()
+    .map_err(|e| format!("Impossibile inizializzare il controllo gateway: {e}"))?;
+  let response = endpoint_probe_request(&client, base, key, endpoint)
     .send()
     .await
     .map_err(|e| format!("Impossibile raggiungere AI Hive: {e}"))?;
@@ -398,7 +466,7 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(target_os = "macos")]
 fn npm_via_login_shell() -> Option<PathBuf> {
   for shell in ["/bin/zsh", "/bin/bash"] {
-    let Ok(output) = Command::new(shell)
+    let Ok(output) = hidden_command(shell)
       .args(["-lic", "command -v npm"])
       .stdin(Stdio::null())
       .output()
@@ -430,15 +498,23 @@ fn npm_via_login_shell() -> Option<PathBuf> {
 
 // PATH of the current process can be stale (e.g. the app is launched from an
 // explorer that started before a PATH update), so on Windows we also read the
-// live PATH values from the registry and expand their %VARS%.
+// live PATH values from the registry and expand their %VARS%. Both hives are
+// needed: the machine PATH alone misses every per-user install (npm prefix,
+// bun, user-local shims), which is exactly where the CLIs usually land.
 #[cfg(windows)]
 fn registry_env() -> std::collections::HashMap<String, String> {
   let mut map = std::collections::HashMap::new();
-  for hive in [
-    "HKCU\\Environment",
+  let mut paths: [Option<String>; 2] = [None, None];
+  // Machine values first, then the user's: a user variable overrides the
+  // machine one with the same name, as it does in a real process environment.
+  for (index, hive) in [
     "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-  ] {
-    let Ok(output) = Command::new("reg").args(["query", hive]).output() else {
+    "HKCU\\Environment",
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let Ok(output) = hidden_command("reg").args(["query", hive]).output() else {
       continue;
     };
     let Ok(raw) = String::from_utf8(output.stdout) else {
@@ -456,12 +532,36 @@ fn registry_env() -> std::collections::HashMap<String, String> {
         continue;
       }
       let value = parts.collect::<Vec<_>>().join(" ");
-      if !value.is_empty() {
+      if value.is_empty() {
+        continue;
+      }
+      // PATH is composed, not overridden: keep the entries of both hives.
+      if name.eq_ignore_ascii_case("PATH") {
+        paths[index] = Some(value);
+      } else {
         map.insert(name.to_uppercase(), value);
       }
     }
   }
+  if let Some(path) = merged_registry_path(paths[0].as_deref(), paths[1].as_deref()) {
+    map.insert("PATH".to_string(), path);
+  }
   map
+}
+
+// A process PATH is the machine entries followed by the user's; joining the
+// two hives reproduces that order. Pure so the merge stays testable on hosts
+// without a registry.
+#[cfg(any(windows, test))]
+fn merged_registry_path(machine: Option<&str>, user: Option<&str>) -> Option<String> {
+  let mut parts: Vec<&str> = Vec::new();
+  for value in [machine, user].into_iter().flatten() {
+    let value = value.trim();
+    if !value.is_empty() {
+      parts.push(value);
+    }
+  }
+  (!parts.is_empty()).then(|| parts.join(";"))
 }
 
 #[cfg(windows)]
@@ -562,6 +662,20 @@ fn application_support_root(home: &Path) -> PathBuf {
   }
 }
 
+// Claude Desktop uses LocalAppData on Windows while other apps may use the
+// conventional roaming application support root above. Keep this path
+// separate so Claude's vendor layout does not redirect unrelated configs.
+fn claude_desktop_data_root_for(home: &Path, local_app_data: Option<&str>, windows: bool) -> PathBuf {
+  if windows {
+    local_app_data
+      .filter(|v| !v.trim().is_empty())
+      .map(PathBuf::from)
+      .unwrap_or_else(|| home.join("AppData").join("Local"))
+  } else {
+    application_support_root(home)
+  }
+}
+
 // Directory of the active npm global prefix (covers nvm/nvm4w layouts where
 // `npm i -g` shims live outside the default %APPDATA%\npm).
 fn npm_global_dir() -> Option<PathBuf> {
@@ -569,11 +683,11 @@ fn npm_global_dir() -> Option<PathBuf> {
   // would miss nvm/Homebrew installs otherwise.
   let npm = find_npm()?;
   let mut command = if cfg!(windows) {
-    let mut c = Command::new("cmd");
+    let mut c = hidden_command("cmd");
     c.arg("/c").arg(&npm);
     c
   } else {
-    Command::new(&npm)
+    hidden_command(&npm)
   };
   command.args(["config", "get", "prefix"]);
   let output = command.output().ok()?;
@@ -586,6 +700,31 @@ fn npm_global_dir() -> Option<PathBuf> {
     return None;
   }
   Some(PathBuf::from(line))
+}
+
+// Claude Code install locations that do not depend on PATH. The native
+// installer ships the binary in ~/.local/bin (claude.exe on Windows) and does
+// not add that directory to PATH, so a GUI-launched app — or simply a user
+// with an older PATH — would never see it. The npm shims are included too so
+// the ordering stays explicit; pure so it is testable off-device.
+fn claude_cli_candidates(home: &Path, appdata: Option<&Path>, windows: bool) -> Vec<PathBuf> {
+  let native = home.join(".local").join("bin");
+  let mut candidates: Vec<PathBuf> = if windows {
+    // .exe first: the extensionless npm shim is a bash script there.
+    vec![
+      native.join("claude.exe"),
+      native.join("claude.cmd"),
+    ]
+  } else {
+    vec![native.join("claude")]
+  };
+  // Checkout/legacy native install that keeps the binary under ~/.claude/local.
+  candidates.push(home.join(".claude").join("local").join("claude"));
+  if let Some(appdata) = appdata {
+    candidates.push(appdata.join("npm").join("claude.cmd"));
+    candidates.push(appdata.join("npm").join("claude.exe"));
+  }
+  candidates
 }
 
 fn find_service_binary(service: &str) -> Option<PathBuf> {
@@ -618,17 +757,11 @@ fn find_service_binary(service: &str) -> Option<PathBuf> {
       }
     }
     "claude" => {
-      if let Ok(appdata) = std::env::var("APPDATA") {
-        let appdata = PathBuf::from(appdata);
-        vec![
-          appdata.join("npm").join("claude.cmd"),
-          appdata.join("npm").join("claude.exe"),
-        ]
-      } else {
-        // npm global installs fall through to the nvm/npm-prefix fallbacks
-        // below; the native installer puts the binary in ~/.local/bin.
-        vec![home.join(".local").join("bin").join("claude")]
-      }
+      // npm global installs fall through to the nvm/npm-prefix fallbacks
+      // below; the native installer puts the binary in ~/.local/bin, which it
+      // does not add to PATH on Windows.
+      let appdata = std::env::var("APPDATA").ok().map(PathBuf::from);
+      claude_cli_candidates(&home, appdata.as_deref(), cfg!(windows))
     }
     _ => return None,
   };
@@ -708,16 +841,29 @@ fn app_bundle_path_in(candidates: &[PathBuf]) -> Option<PathBuf> {
 // repeating the tasklist/pgrep details. Each helper is compiled only on its
 // own platform; macOS never sees them.
 
+// Command for a detached desktop app, with the environment quirks that would
+// turn an Electron GUI into a stub removed. When the bridge is itself started
+// from an Electron host (VS Code's terminal, an editor-managed harness) the
+// inherited ELECTRON_RUN_AS_NODE=1 makes the child's main process run as plain
+// Node: it exits at once and no window appears. Pure so the removal stays
+// testable without spawning anything.
+#[cfg(any(windows, target_os = "linux"))]
+fn desktop_app_command(bin: &Path, env: &[(&str, &str)]) -> Command {
+  let mut command = Command::new(bin);
+  command.env_remove("ELECTRON_RUN_AS_NODE");
+  for (name, value) in env {
+    command.env(name, value);
+  }
+  command
+}
+
 // Launch a desktop app executable detached. The cross-platform sibling of
 // `open_app_bundle` (macOS): stdio is nulled so the child outlives this call.
 // No CREATE_NEW_CONSOLE here, unlike `spawn_cli`, because these are GUI
 // (windows-subsystem) apps that own their window rather than a console.
 #[cfg(any(windows, target_os = "linux"))]
 fn desktop_spawn_app(bin: &Path, env: &[(&str, &str)], label: &str) -> Result<(), String> {
-  let mut command = Command::new(bin);
-  for (name, value) in env {
-    command.env(name, value);
-  }
+  let mut command = desktop_app_command(bin, env);
   command
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -732,7 +878,7 @@ fn desktop_spawn_app(bin: &Path, env: &[(&str, &str)], label: &str) -> Result<()
 #[cfg(windows)]
 fn desktop_process_running(names: &[&str]) -> bool {
   for name in names {
-    let Ok(output) = Command::new("tasklist")
+    let Ok(output) = hidden_command("tasklist")
       .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
@@ -754,7 +900,7 @@ fn desktop_process_running(names: &[&str]) -> bool {
 #[cfg(target_os = "linux")]
 fn desktop_process_running(names: &[&str]) -> bool {
   for name in names {
-    let running = Command::new("pgrep")
+    let running = hidden_command("pgrep")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -774,7 +920,7 @@ fn desktop_process_running(names: &[&str]) -> bool {
 #[cfg(windows)]
 fn desktop_process_quit(names: &[&str]) {
   for name in names {
-    Command::new("taskkill")
+    hidden_command("taskkill")
       .args(["/F", "/IM", name])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -787,7 +933,7 @@ fn desktop_process_quit(names: &[&str]) {
 #[cfg(target_os = "linux")]
 fn desktop_process_quit(names: &[&str]) {
   for name in names {
-    Command::new("pkill")
+    hidden_command("pkill")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -866,13 +1012,20 @@ fn opencode_app_path() -> Option<PathBuf> {
 }
 
 // Pure candidate search so the layout matching stays testable on any host.
-// The current per-user installer lays the app under the npm-scope directory
-// "@opencode-aidesktop"; the bare vendor names cover older layouts.
+// The current per-user installer lays the app under the reverse-DNS directory
+// "ai.opencode.desktop" (verified on a real Windows device); the npm-scope
+// "@opencode-aidesktop" and the bare vendor names cover older layouts.
 #[cfg(any(windows, test))]
 fn opencode_app_path_in(roots: &[PathBuf]) -> Option<PathBuf> {
   let mut candidates: Vec<PathBuf> = Vec::new();
   for root in roots {
-    for dir in ["OpenCode", "opencode", "OpenCode Desktop", "@opencode-aidesktop"] {
+    for dir in [
+      "ai.opencode.desktop",
+      "OpenCode",
+      "opencode",
+      "OpenCode Desktop",
+      "@opencode-aidesktop",
+    ] {
       for exe in ["OpenCode.exe", "opencode-desktop.exe", "OpenCode Desktop.exe"] {
         candidates.push(root.join(dir).join(exe));
       }
@@ -935,7 +1088,7 @@ fn chatgpt_app_bundle() -> Option<PathBuf> {
 // from Get-AppxPackage, the in-package executable path from the manifest.
 #[cfg(windows)]
 fn appx_package_full_name(name_pattern: &str) -> Option<String> {
-  let output = Command::new("powershell")
+  let output = hidden_command("powershell")
     .args([
       "-NoProfile",
       "-NonInteractive",
@@ -1082,7 +1235,7 @@ pub async fn launch_service(
   match (service.as_str(), mode.as_str()) {
     ("opencode", "terminal") => {
       let directory = require_project_directory(project_directory.as_deref())?;
-      launch_opencode_cli(&app, model, key, &directory)
+      launch_opencode_cli(&app, model, key, &directory).await
     }
     ("codex", "terminal") => {
       let directory = require_project_directory(project_directory.as_deref())?;
@@ -1445,7 +1598,8 @@ fn write_opencode_config_in(home: &Path, model: &str, key: &str) -> Result<PathB
     if !opencode_configured_in(home) {
       let backup = opencode_backup_for(&path);
       if !backup.exists() {
-        let _ = std::fs::write(&backup, raw.as_str());
+        std::fs::write(&backup, raw.as_str())
+          .map_err(|e| format!("Backup di {} non riuscito: {e}", path.display()))?;
       }
     }
     parsed
@@ -1470,7 +1624,7 @@ fn write_opencode_config(model: &str, key: &str) -> Result<(), String> {
 // environment to the app, so `env` pins the variables the app must see.
 #[cfg(target_os = "macos")]
 fn open_app_bundle(bundle: &Path, label: &str, env: &[(&str, &str)]) -> Result<(), String> {
-  let mut command = Command::new("open");
+  let mut command = hidden_command("open");
   command.arg(bundle);
   for (name, value) in env {
     command.env(name, value);
@@ -1497,7 +1651,7 @@ fn hive_codex_home() -> Option<PathBuf> {
 // the bundle executable is "OpenCode", so the lowercase CLI is not matched.
 #[cfg(target_os = "macos")]
 fn opencode_app_running() -> bool {
-  Command::new("pgrep")
+  hidden_command("pgrep")
     .args(["-x", "OpenCode"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -1524,7 +1678,7 @@ fn opencode_app_running() -> bool {
 // whether a running instance must be restarted, because the app reads that
 // config only at startup.
 #[tauri::command]
-pub fn configure_opencode_app(model: String, key: String) -> Result<AppRestartResult, String> {
+pub async fn configure_opencode_app(model: String, key: String) -> Result<AppRestartResult, String> {
   let model = model.trim();
   let key = key.trim();
   if model.is_empty() {
@@ -1540,6 +1694,7 @@ pub fn configure_opencode_app(model: String, key: String) -> Result<AppRestartRe
     let not_found = "OpenCode Desktop non trovato: installalo e riprova.";
     return Err(String::from(not_found));
   }
+  assert_endpoint_available(&hive_openai_base_url(), key, "/chat/completions", "OpenCode").await?;
   write_opencode_config(model, key)?;
   Ok(AppRestartResult {
     restart_required: opencode_app_running(),
@@ -1569,7 +1724,7 @@ fn quit_and_reopen_opencode() -> Result<(), String> {
   let bundle = opencode_app_path()
     .ok_or_else(|| String::from("OpenCode.app non trovato in /Applications: installalo e riprova."))?;
   if opencode_app_running() {
-    Command::new("pkill")
+    hidden_command("pkill")
       .args(["-x", "OpenCode"])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -1619,7 +1774,7 @@ pub fn restart_opencode_app() -> Result<(), String> {
   quit_and_reopen_opencode()
 }
 
-fn launch_opencode_cli(
+async fn launch_opencode_cli(
   app: &tauri::AppHandle,
   model: &str,
   key: &str,
@@ -1627,6 +1782,7 @@ fn launch_opencode_cli(
 ) -> Result<(), String> {
   let bin = find_service_binary("opencode")
     .ok_or_else(|| String::from("OpenCode CLI non trovata. Installala da https://opencode.ai/download."))?;
+  assert_endpoint_available(&hive_openai_base_url(), key, "/chat/completions", "OpenCode").await?;
   write_opencode_config(model, key)?;
   launch_cli(app, "opencode", &bin, &[], &[], working_directory)
 }
@@ -1704,6 +1860,10 @@ fn codex_catalog_path_in(home: &Path) -> PathBuf {
   codex_dir_in(home).join(HIVE_CATALOG_FILE)
 }
 
+fn codex_catalog_backup_path_in(home: &Path) -> PathBuf {
+  codex_dir_in(home).join(format!("{HIVE_CATALOG_FILE}.hive.bak"))
+}
+
 // model_catalog_json requires Codex >= 0.134.0; older CLIs fail to start
 // with an opaque config error, so check the version up front.
 const CODEX_MIN_VERSION: &str = "0.134.0";
@@ -1714,7 +1874,7 @@ fn codex_version_ok(version: &str) -> bool {
 }
 
 fn check_codex_version(bin: &Path) -> Result<(), String> {
-  let output = Command::new(bin)
+  let output = hidden_command(bin)
     .arg("--version")
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -1865,16 +2025,6 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
   // this returns true and the user's files would never be backed up.
   let was_ours = chatgpt_app_configured_in(home);
   let catalog_path = codex_catalog_path_in(home);
-  // An empty list means the caller could not fetch the models (e.g. the key
-  // change path). Keeping the catalog on disk is right: overwriting it with
-  // {"models": []} would empty the picker and drop the context windows.
-  if !models.is_empty() {
-    let catalog = build_hive_catalog(models);
-    let rendered = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
-    std::fs::write(&catalog_path, rendered + "\n")
-      .map_err(|e| format!("Impossibile scrivere {}: {e}", catalog_path.display()))?;
-  }
-
   let config_path = codex_config_path_in(home);
   let backup_path = codex_config_backup_path_in(home);
   let mut table: toml::Table = if config_path.exists() {
@@ -1887,12 +2037,26 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
     // CLI launch and on every key change, so a plain "!backup exists" guard
     // would snapshot the Hive config as the user's "original".
     if !backup_path.exists() && !was_ours {
-      let _ = std::fs::write(&backup_path, raw.as_str());
+      std::fs::write(&backup_path, raw.as_str())
+        .map_err(|e| format!("Backup di {} non riuscito: {e}", config_path.display()))?;
     }
     parsed
   } else {
     toml::Table::new()
   };
+  // Parsing the config is a preflight: malformed user TOML must not leave a
+  // catalog written behind when configuration itself cannot proceed.
+  if !models.is_empty() {
+    let catalog = build_hive_catalog(models);
+    let rendered = serde_json::to_string_pretty(&catalog).map_err(|e| e.to_string())?;
+    let catalog_backup = codex_catalog_backup_path_in(home);
+    if catalog_path.exists() && !was_ours && !catalog_backup.exists() {
+      std::fs::copy(&catalog_path, &catalog_backup)
+        .map_err(|e| format!("Backup di {} non riuscito: {e}", catalog_path.display()))?;
+    }
+    std::fs::write(&catalog_path, rendered + "\n")
+      .map_err(|e| format!("Impossibile scrivere {}: {e}", catalog_path.display()))?;
+  }
   table.insert("model".into(), toml::Value::String(model.to_string()));
   table.insert("model_provider".into(), toml::Value::String(HIVE_PROVIDER_ID.into()));
   table.insert("model_catalog_json".into(), toml::Value::String(catalog_path.to_string_lossy().into_owned()));
@@ -1929,7 +2093,8 @@ fn configure_chatgpt_app_in(home: &Path, model: &str, models: &[HiveModel], key:
   if auth_path.exists() && !auth_backup.exists() && !was_ours {
     let raw = std::fs::read_to_string(&auth_path)
       .map_err(|e| format!("Impossibile leggere {}: {e}", auth_path.display()))?;
-    let _ = std::fs::write(&auth_backup, raw.as_str());
+    std::fs::write(&auth_backup, raw.as_str())
+      .map_err(|e| format!("Backup di {} non riuscito: {e}", auth_path.display()))?;
   }
   let auth = serde_json::json!({
     "OPENAI_API_KEY": key,
@@ -2004,14 +2169,39 @@ fn restore_chatgpt_app_in(home: &Path, key: &str) -> Result<(), String> {
 
   let auth_path = codex_auth_path_in(home);
   let auth_backup = codex_auth_backup_path_in(home);
-  if auth_path.exists() {
-    if auth_backup.exists() {
+  if auth_backup.exists() {
+    let restore_backup = match std::fs::read_to_string(&auth_path) {
+      Ok(raw) => {
+        let current: serde_json::Value = serde_json::from_str(&raw)
+          .map_err(|e| format!("{} non è JSON valido: {e}", auth_path.display()))?;
+        let Some(object) = current.as_object() else {
+          return Err(format!("{} deve contenere un oggetto JSON", auth_path.display()));
+        };
+        let auth_mode = object
+          .get("auth_mode")
+          .and_then(|v| v.as_str())
+          .ok_or_else(|| format!("{} non contiene auth_mode valido", auth_path.display()))?;
+        let current_key = object.get("OPENAI_API_KEY").and_then(|v| v.as_str());
+        let is_ours = auth_mode == "apikey" && current_key == Some(key);
+        if !is_ours && auth_mode != "chatgpt" && !(auth_mode == "apikey" && current_key.is_some()) {
+          return Err(format!("{} non contiene una sessione Codex riconosciuta", auth_path.display()));
+        }
+        is_ours
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+      Err(e) => return Err(format!("Impossibile leggere {}: {e}", auth_path.display())),
+    };
+    if restore_backup {
       let raw = std::fs::read_to_string(&auth_backup)
         .map_err(|e| format!("Impossibile leggere {}: {e}", auth_backup.display()))?;
       std::fs::write(&auth_path, raw)
         .map_err(|e| format!("Impossibile scrivere {}: {e}", auth_path.display()))?;
-      std::fs::remove_file(&auth_backup).map_err(|e| e.to_string())?;
-    } else if let Ok(raw) = std::fs::read_to_string(&auth_path) {
+    }
+    // Keep a newer OAuth or API-key login; never replay this stale snapshot on
+    // a later restore after the user has logged in again.
+    std::fs::remove_file(&auth_backup).map_err(|e| e.to_string())?;
+  } else if auth_path.exists() {
+    if let Ok(raw) = std::fs::read_to_string(&auth_path) {
       // Without a backup the auth was created by this launcher: remove it only
       // while it still holds the Hive key, never a user login or other key.
       let is_ours = serde_json::from_str::<serde_json::Value>(&raw)
@@ -2027,7 +2217,19 @@ fn restore_chatgpt_app_in(home: &Path, key: &str) -> Result<(), String> {
   }
 
   if strip_catalog {
-    let _ = std::fs::remove_file(codex_catalog_path_in(home));
+    let catalog_path = codex_catalog_path_in(home);
+    let catalog_backup = codex_catalog_backup_path_in(home);
+    if catalog_backup.exists() {
+      std::fs::copy(&catalog_backup, &catalog_path)
+        .map_err(|e| format!("Ripristino di {} non riuscito: {e}", catalog_path.display()))?;
+      std::fs::remove_file(&catalog_backup).map_err(|e| e.to_string())?;
+    } else {
+      match std::fs::remove_file(&catalog_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+      }
+    }
   }
 
   // Files written by earlier versions of the launcher (dedicated CLI profile
@@ -2044,7 +2246,7 @@ fn restore_chatgpt_app_in(home: &Path, key: &str) -> Result<(), String> {
 // models until it is restarted.
 #[cfg(target_os = "macos")]
 fn chatgpt_app_running() -> bool {
-  Command::new("pgrep")
+  hidden_command("pgrep")
     .args(["-x", "ChatGPT"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2076,7 +2278,7 @@ fn quit_and_reopen_chatgpt() -> Result<(), String> {
   let bundle = chatgpt_app_bundle()
     .ok_or_else(|| String::from("ChatGPT.app non trovato in /Applications: installalo e riprova."))?;
   if chatgpt_app_running() {
-    Command::new("osascript")
+    hidden_command("osascript")
       .args(["-e", "tell application \"ChatGPT\" to quit"])
       .stdin(Stdio::null())
       .stdout(Stdio::null())
@@ -2092,7 +2294,7 @@ fn quit_and_reopen_chatgpt() -> Result<(), String> {
       std::thread::sleep(std::time::Duration::from_millis(500));
     }
     if chatgpt_app_running() {
-      Command::new("pkill")
+      hidden_command("pkill")
         .args(["-x", "ChatGPT"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2260,8 +2462,17 @@ struct ClaudeDesktopPaths {
   profile: PathBuf,
 }
 
+struct ClaudeDesktopSnapshot {
+  files: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
 fn claude_desktop_paths_in(home: &Path) -> ClaudeDesktopPaths {
-  let support = application_support_root(home);
+  let local_app_data = if cfg!(windows) && home_dir().as_deref() == Some(home) {
+    std::env::var("LOCALAPPDATA").ok()
+  } else {
+    None
+  };
+  let support = claude_desktop_data_root_for(home, local_app_data.as_deref(), cfg!(windows));
   let normal = support.join("Claude");
   let third_party = support.join("Claude-3p");
   let library = third_party.join("configLibrary");
@@ -2271,6 +2482,46 @@ fn claude_desktop_paths_in(home: &Path) -> ClaudeDesktopPaths {
     meta: library.join("_meta.json"),
     profile: library.join(format!("{CLAUDE_DESKTOP_PROFILE_ID}.json")),
   }
+}
+
+fn capture_claude_desktop_snapshot(home: &Path) -> Result<ClaudeDesktopSnapshot, String> {
+  let paths = claude_desktop_paths_in(home);
+  let files = [
+    paths.normal_config,
+    paths.third_party_config,
+    paths.meta,
+    paths.profile,
+  ]
+  .into_iter()
+  .map(|path| {
+    let content = match std::fs::read(&path) {
+      Ok(bytes) => Some(bytes),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+      Err(e) => return Err(format!("Impossibile leggere {}: {e}", path.display())),
+    };
+    Ok((path, content))
+  })
+  .collect::<Result<Vec<_>, String>>()?;
+  Ok(ClaudeDesktopSnapshot { files })
+}
+
+fn apply_claude_desktop_snapshot(snapshot: &ClaudeDesktopSnapshot) -> Result<(), String> {
+  for (path, content) in &snapshot.files {
+    if let Some(content) = content {
+      if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+      }
+      std::fs::write(path, content)
+        .map_err(|e| format!("Ripristino di {} non riuscito: {e}", path.display()))?;
+    } else {
+      match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("Impossibile rimuovere {}: {e}", path.display())),
+      }
+    }
+  }
+  Ok(())
 }
 
 fn backup_path_for(path: &Path) -> PathBuf {
@@ -2354,15 +2605,30 @@ fn claude_desktop_configured_in(home: &Path) -> bool {
   profile.get("inferenceGatewayBaseUrl") == Some(&serde_json::json!(hive_anthropic_base_url()))
 }
 
+fn reapply_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
+  let paths = claude_desktop_paths_in(home);
+  if !claude_desktop_configured_in(home) {
+    return Ok(());
+  }
+  // The configuration and metadata already point at our managed profile.
+  // Update only that profile so a missing old backup can never be replaced
+  // with the current Hive state during a key rotation.
+  write_json(&paths.profile, &claude_desktop_profile_value(model, key))
+}
+
 fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<(), String> {
   let paths = claude_desktop_paths_in(home);
-  for path in [
-    &paths.normal_config,
-    &paths.third_party_config,
-    &paths.meta,
-    &paths.profile,
-  ] {
-    backup_once(path)?;
+  // Reconfiguration/restart must not snapshot files created by the first
+  // Hive launch as the user's original state.
+  if !claude_desktop_our_profile(&paths.profile) {
+    for path in [
+      &paths.normal_config,
+      &paths.third_party_config,
+      &paths.meta,
+      &paths.profile,
+    ] {
+      backup_once(path)?;
+    }
   }
   set_deployment_mode(&paths.normal_config, "3p")?;
   set_deployment_mode(&paths.third_party_config, "3p")?;
@@ -2388,15 +2654,21 @@ fn configure_claude_desktop_in(home: &Path, model: &str, key: &str) -> Result<()
 
 fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
   let paths = claude_desktop_paths_in(home);
-  // Restore every backup taken at configure time: the original content (and
-  // deployment mode) comes back exactly as it was.
-  let mut restored = Vec::new();
-  for path in [
+  let managed_profile = claude_desktop_our_profile(&paths.profile);
+  let file_paths = [
     &paths.normal_config,
     &paths.third_party_config,
     &paths.meta,
     &paths.profile,
-  ] {
+  ];
+  let has_backup = file_paths.iter().any(|path| backup_path_for(path).exists());
+  if !managed_profile && !has_backup {
+    return Ok(());
+  }
+  // Restore every backup taken at configure time: the original content (and
+  // deployment mode) comes back exactly as it was.
+  let mut restored = Vec::new();
+  for path in file_paths {
     let backup = backup_path_for(path);
     if backup.exists() {
       std::fs::copy(&backup, path)
@@ -2408,18 +2680,20 @@ fn restore_claude_desktop_in(home: &Path) -> Result<(), String> {
   // Fallbacks for files configure created from scratch (no backup existed):
   // drop the managed profile when it is ours, and undo the 3p switch we made
   // in configs that did not exist before.
-  if claude_desktop_our_profile(&paths.profile) {
+  let profile_restored = restored.contains(&&paths.profile);
+  let meta_restored = restored.contains(&&paths.meta);
+  if !profile_restored && managed_profile {
     let _ = std::fs::remove_file(&paths.profile);
   }
   for path in [&paths.normal_config, &paths.third_party_config] {
-    if !restored.contains(&path) && path.exists() {
+    if !restored.contains(&path) && managed_profile && path.exists() {
       let cfg = read_json_allow_missing(path)?;
       if cfg.get("deploymentMode") == Some(&serde_json::json!("3p")) {
         set_deployment_mode(path, "1p")?;
       }
     }
   }
-  if paths.meta.exists() {
+  if !meta_restored && managed_profile && paths.meta.exists() {
     let mut meta = read_json_allow_missing(&paths.meta)?;
     if let Some(entries) = meta.get_mut("entries").and_then(|e| e.as_array_mut()) {
       entries.retain(|e| e.get("id") != Some(&serde_json::json!(CLAUDE_DESKTOP_PROFILE_ID)));
@@ -2453,7 +2727,7 @@ async fn assert_claude_gateway_available(key: &str) -> Result<(), String> {
     .await
     .map_err(|e| {
       format!(
-        "Gateway Claude non raggiungibile su {url}: {e}. Avvia il proxy locale (bun dev) e riprova."
+        "Gateway Claude non raggiungibile su {url}: {e}. Verifica la connessione e riprova."
       )
     })?;
   let status = response.status();
@@ -2463,12 +2737,12 @@ async fn assert_claude_gateway_available(key: &str) -> Result<(), String> {
   if !status.is_success() {
     return Err(format!("Gateway Claude ha risposto con lo stato {status}"));
   }
-  Ok(())
+  assert_messages_available(key, "Claude Desktop").await
 }
 
 #[cfg(target_os = "macos")]
 fn claude_desktop_running() -> bool {
-  Command::new("pgrep")
+  hidden_command("pgrep")
     .args(["-f", "Claude.app/Contents/MacOS/Claude"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2493,7 +2767,7 @@ fn claude_desktop_running() -> bool {
 
 #[cfg(target_os = "macos")]
 fn quit_claude_desktop() {
-  Command::new("osascript")
+  hidden_command("osascript")
     .args(["-e", "tell application \"Claude\" to quit"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2506,7 +2780,7 @@ fn quit_claude_desktop() {
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
   }
-  Command::new("pkill")
+  hidden_command("pkill")
     .args(["-f", "Claude.app/Contents/MacOS/Claude"])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -2591,7 +2865,9 @@ pub fn restart_claude_desktop(model: String, key: String) -> Result<(), String> 
 // the shutdown persistence cannot bring the Hive profile back.
 #[tauri::command]
 pub fn restart_claude_desktop_restored() -> Result<(), String> {
-  restart_claude_desktop_with(restore_claude_desktop_in)
+  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
+  let snapshot = capture_claude_desktop_snapshot(&home)?;
+  restart_claude_desktop_with(move |_| apply_claude_desktop_snapshot(&snapshot))
 }
 
 #[tauri::command]
@@ -2883,14 +3159,13 @@ async fn launch_hermes_cli(
 // Hermes Agent su AI Hive
 // ---------------------------------------------------------------------------
 // Hermes Agent (hermes-agent.nousresearch.com) ships two surfaces: a desktop
-// app and a standalone CLI. Both are configured with environment variables
-// only, so nothing is persisted and there is no restore.
+// app and a standalone CLI. Both read the persistent provider and model in
+// config.yaml; restore uses the one-shot file backups.
 //
 // The desktop app runs its own agent runtime and cannot receive env vars once
 // it is open, so a running instance needs a confirmed restart (like
-// ChatGPT.app). The CLI is pointed at AI Hive through the built-in openai-api
-// provider, which reads its endpoint from OPENAI_BASE_URL and its key from
-// OPENAI_API_KEY; the provider and model are pinned per invocation.
+// ChatGPT.app). The CLI reads the default home config, while the desktop app
+// may read its active named profile config.
 const HERMES_DOWNLOAD_URL: &str = "https://hermes-agent.nousresearch.com/";
 
 // The macOS bundle is named HERMES-IDE.app; match any *.app whose name
@@ -2933,7 +3208,7 @@ fn is_setup_bundle_id(identifier: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn is_setup_bundle(bundle: &Path) -> bool {
-  let Ok(output) = Command::new("plutil")
+  let Ok(output) = hidden_command("plutil")
     .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
     .arg(bundle.join("Contents").join("Info.plist"))
     .stdin(Stdio::null())
@@ -2973,10 +3248,27 @@ fn hermes_app_path() -> Option<PathBuf> {
     .or_else(|| hermes_repo_app_path_in(&hermes_root_in(&home)))
 }
 
+// Windows counterpart of the macOS checkout fallback: the same build tree lays
+// the desktop app out as release/<arch>/win-unpacked/Hermes.exe, so the release
+// directories are scanned one level down. Pure so it stays testable off-device.
+#[cfg(any(windows, test))]
+fn hermes_checkout_app_path_in(root: &Path) -> Option<PathBuf> {
+  let release = root.join("hermes-agent").join("apps").join("desktop").join("release");
+  let mut found: Vec<PathBuf> = std::fs::read_dir(release)
+    .ok()?
+    .flatten()
+    .map(|entry| entry.path().join("Hermes.exe"))
+    .filter(|exe| exe.is_file())
+    .collect();
+  found.sort();
+  found.into_iter().next()
+}
+
 // Windows: the desktop app is the GUI build (Hermes.exe), a separate surface
 // from the CLI, which is launched through hermes_cli_path — so `hermes` on PATH
 // is deliberately not a candidate here. The NSIS installer lays the app out
-// under %LOCALAPPDATA%\Programs; the HERMES-IDE spellings cover the older name.
+// under %LOCALAPPDATA%\Programs; the HERMES-IDE spellings cover the older name,
+// and the "git" installer builds the app in place under the checkout instead.
 #[cfg(windows)]
 fn hermes_app_path() -> Option<PathBuf> {
   let Ok(local) = std::env::var("LOCALAPPDATA") else {
@@ -2991,7 +3283,12 @@ fn hermes_app_path() -> Option<PathBuf> {
       }
     }
   }
-  None
+  let mut roots: Vec<PathBuf> = Vec::new();
+  if let Ok(home) = std::env::var("HERMES_HOME") {
+    roots.push(PathBuf::from(home));
+  }
+  roots.push(Path::new(&local).join("hermes"));
+  roots.into_iter().find_map(|root| hermes_checkout_app_path_in(&root))
 }
 
 #[cfg(target_os = "linux")]
@@ -3001,14 +3298,27 @@ fn hermes_app_path() -> Option<PathBuf> {
   None
 }
 
+// Windows launchers: the packaged installer exposes the venv entry point, while
+// the "git" installer writes a bin/hermes.exe shim next to the checkout. Both
+// forms are proposed, so whichever the install method produced gets detected.
+#[cfg(any(windows, test))]
+fn hermes_windows_cli_candidates(roots: &[PathBuf]) -> Vec<PathBuf> {
+  let mut candidates = Vec::new();
+  for root in roots {
+    candidates.push(root.join("hermes-agent").join("venv").join("Scripts").join("hermes.exe"));
+    candidates.push(root.join("bin").join("hermes.exe"));
+  }
+  candidates
+}
+
 // The Hermes CLI launcher: `hermes` on PATH, or the wrapper install.sh writes
-// to ~/.local/bin on POSIX. Windows installs the checkout under
-// %HERMES_HOME%/%LOCALAPPDATA%[\hermes] and exposes hermes.exe in its venv.
+// to ~/.local/bin on POSIX, or the Windows checkout's bin/ shim.
 fn hermes_cli_path() -> Option<PathBuf> {
   if let Some(bin) = find_on_path("hermes") {
     return Some(bin);
   }
-  if cfg!(windows) {
+  #[cfg(windows)]
+  {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(home) = std::env::var("HERMES_HOME") {
       roots.push(PathBuf::from(home));
@@ -3017,16 +3327,15 @@ fn hermes_cli_path() -> Option<PathBuf> {
       roots.push(PathBuf::from(&local));
       roots.push(PathBuf::from(local).join("hermes"));
     }
-    for root in roots {
-      let candidate = root.join("hermes-agent").join("venv").join("Scripts").join("hermes.exe");
-      if candidate.is_file() {
-        return Some(candidate);
-      }
-    }
-    return None;
+    hermes_windows_cli_candidates(&roots)
+      .into_iter()
+      .find(|candidate| candidate.is_file())
   }
-  let fallback = home_dir()?.join(".local").join("bin").join("hermes");
-  fallback.is_file().then_some(fallback)
+  #[cfg(not(windows))]
+  {
+    let fallback = home_dir()?.join(".local").join("bin").join("hermes");
+    fallback.is_file().then_some(fallback)
+  }
 }
 
 // True when the Hermes desktop app is live. The macOS bundle ships the app as
@@ -3035,7 +3344,7 @@ fn hermes_cli_path() -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 fn hermes_app_running() -> bool {
   for name in ["Hermes", "HERMES-IDE", "hermes-ide"] {
-    let running = Command::new("pgrep")
+    let running = hidden_command("pgrep")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -3072,25 +3381,53 @@ fn hermes_app_running() -> bool {
 // ---------------------------------------------------------------------------
 // Hermes Agent: config.yaml su AI Hive
 // ---------------------------------------------------------------------------
-// Hermes resolves its provider from ~/.hermes/config.yaml, so the launcher
+// Hermes resolves its provider from its platform config root, so the launcher
 // rewrites `model` and registers a named provider instead of exporting env
 // vars: a provider named "ReQurv" is what the UI shows, and the key travels
 // inline in the provider entry (no OPENAI_*/CUSTOM_BASE_URL in the process
-// environment). The file is machine-generated with one top-level key per line,
-// so the edit is textual — a full YAML round-trip would need a new dependency
-// and would reformat the user's file.
+// environment). YAML parsing preserves unrelated values and refuses malformed
+// files before any backup or write is attempted.
 const HERMES_CONFIG_FILE: &str = "config.yaml";
 const HERMES_PROVIDER_KEY: &str = "requrv";
 const HERMES_PROVIDER_NAME: &str = "ReQurv";
+// The gateway advertises the reasoning levels it accepts (low/medium/xhigh for
+// the current models); the launcher pins the middle one, so a session reasons
+// as much as the model is meant to. The CLI's picker still allows raising it.
+const HERMES_REASONING_EFFORT: &str = "medium";
 
-// Root of the Hermes installation/config. Mirrors what Hermes itself uses:
-// $HERMES_HOME when set, ~/.hermes otherwise.
+fn hermes_root_for_platform(
+  home: &Path,
+  hermes_home: Option<&str>,
+  local_app_data: Option<&str>,
+  windows: bool,
+) -> PathBuf {
+  if let Some(root) = hermes_home.filter(|value| !value.trim().is_empty()) {
+    return PathBuf::from(root);
+  }
+  if windows {
+    return local_app_data
+      .filter(|value| !value.trim().is_empty())
+      .map(PathBuf::from)
+      .unwrap_or_else(|| home.join("AppData").join("Local"))
+      .join("hermes");
+  }
+  home.join(".hermes")
+}
+
 fn hermes_root_in(home: &Path) -> PathBuf {
-  std::env::var("HERMES_HOME")
-    .ok()
-    .filter(|value| !value.trim().is_empty())
-    .map(PathBuf::from)
-    .unwrap_or_else(|| home.join(".hermes"))
+  let is_process_home = home_dir().as_deref() == Some(home);
+  let hermes_home = if is_process_home { std::env::var("HERMES_HOME").ok() } else { None };
+  let local_app_data = if cfg!(windows) && is_process_home {
+    std::env::var("LOCALAPPDATA").ok()
+  } else {
+    None
+  };
+  hermes_root_for_platform(
+    home,
+    hermes_home.as_deref(),
+    local_app_data.as_deref(),
+    cfg!(windows),
+  )
 }
 
 fn hermes_config_path_at(root: &Path) -> PathBuf {
@@ -3117,70 +3454,55 @@ fn hermes_config_paths_at(root: &Path) -> Vec<PathBuf> {
   paths
 }
 
-// Range of a top-level `key:` block: its own line plus every following indented
-// (or blank) line, stopping at the next top-level key.
-fn top_level_block(lines: &[&str], key: &str) -> Option<(usize, usize)> {
-  let needle = format!("{key}:");
-  let start = lines.iter().position(|line| line.starts_with(&needle))?;
-  let mut end = start + 1;
-  while end < lines.len() {
-    let line = lines[end];
-    if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('-') {
-      break;
-    }
-    end += 1;
-  }
-  Some((start, end))
+fn yaml_string(value: &str) -> serde_yaml::Value {
+  serde_yaml::Value::String(value.to_string())
 }
 
-// Rewrite `model` and the `providers` entry, leaving every other key untouched.
-fn merge_hermes_provider(raw: &str, model: &str, key: &str) -> String {
-  let base = hive_openai_base_url();
-  let model_block = [
-    String::from("model:"),
-    format!("  default: {model}"),
-    format!("  provider: custom:{HERMES_PROVIDER_KEY}"),
-    format!("  base_url: {base}"),
-  ];
-  let provider_block = [
-    String::from("providers:"),
-    format!("  {HERMES_PROVIDER_KEY}:"),
-    format!("    name: {HERMES_PROVIDER_NAME}"),
-    format!("    api: {base}"),
-    format!("    api_key: {key}"),
-    String::from("    models:"),
-    format!("      {model}: {{}}"),
-  ];
+fn yaml_mapping_at<'a>(
+  parent: &'a mut serde_yaml::Mapping,
+  key: &str,
+  path: &Path,
+) -> Result<&'a mut serde_yaml::Mapping, String> {
+  let key_value = yaml_string(key);
+  if !parent.contains_key(&key_value) || parent.get(&key_value) == Some(&serde_yaml::Value::Null) {
+    parent.insert(key_value.clone(), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+  }
+  parent
+    .get_mut(&key_value)
+    .and_then(serde_yaml::Value::as_mapping_mut)
+    .ok_or_else(|| format!("{}: il campo {key} deve essere una mappa YAML", path.display()))
+}
 
-  let original: Vec<&str> = raw.lines().collect();
-  let mut out: Vec<String> = Vec::with_capacity(original.len() + 12);
-  let mut providers_written = false;
-  let mut index = 0;
-  while index < original.len() {
-    if let Some((start, end)) = top_level_block(&original, "model") {
-      if index == start {
-        out.extend(model_block.iter().cloned());
-        index = end;
-        continue;
-      }
-    }
-    if let Some((start, end)) = top_level_block(&original, "providers") {
-      if index == start {
-        out.extend(provider_block.iter().cloned());
-        providers_written = true;
-        index = end;
-        continue;
-      }
-    }
-    out.push(original[index].to_string());
-    index += 1;
-  }
-  if !providers_written {
-    out.extend(provider_block.iter().cloned());
-  }
-  let mut rendered = out.join("\n");
-  rendered.push('\n');
-  rendered
+// Rewrite only the Hive-owned model fields and provider entry; other model
+// options, other providers and other root values survive the YAML round trip.
+fn merge_hermes_provider(raw: &str, model: &str, key: &str, path: &Path) -> Result<String, String> {
+  let mut root: serde_yaml::Value = serde_yaml::from_str(raw)
+    .map_err(|e| format!("{} non è YAML valido: {e}. Correggi il file e riprova.", path.display()))?;
+  let Some(root) = root.as_mapping_mut() else {
+    return Err(format!("{} deve contenere una mappa YAML", path.display()));
+  };
+  let model_map = yaml_mapping_at(root, "model", path)?;
+  model_map.insert(yaml_string("default"), yaml_string(model));
+  model_map.insert(yaml_string("provider"), yaml_string(&format!("custom:{HERMES_PROVIDER_KEY}")));
+  model_map.insert(yaml_string("base_url"), yaml_string(&hive_openai_base_url()));
+
+  let agent = yaml_mapping_at(root, "agent", path)?;
+  agent.insert(
+    yaml_string("reasoning_effort"),
+    yaml_string(HERMES_REASONING_EFFORT),
+  );
+
+  let providers = yaml_mapping_at(root, "providers", path)?;
+  let provider = yaml_mapping_at(providers, HERMES_PROVIDER_KEY, path)?;
+  let base = hive_openai_base_url();
+  provider.insert(yaml_string("name"), yaml_string(HERMES_PROVIDER_NAME));
+  provider.insert(yaml_string("api"), yaml_string(&base));
+  provider.insert(yaml_string("api_key"), yaml_string(key));
+  let models = yaml_mapping_at(provider, "models", path)?;
+  models.insert(yaml_string(model), serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+  let rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(root.clone()))
+    .map_err(|e| format!("{}: YAML non serializzabile: {e}", path.display()))?;
+  Ok(rendered)
 }
 
 // True when this config already carries the provider block the launcher writes.
@@ -3188,14 +3510,14 @@ fn hermes_config_has_provider(path: &Path) -> bool {
   let Ok(raw) = std::fs::read_to_string(path) else {
     return false;
   };
-  let lines: Vec<&str> = raw.lines().collect();
-  let Some((start, end)) = top_level_block(&lines, "providers") else {
+  let Ok(root) = serde_yaml::from_str::<serde_yaml::Value>(&raw) else {
     return false;
   };
-  let base = hive_openai_base_url();
-  let block = &lines[start..end];
-  block.iter().any(|line| line.trim() == format!("{HERMES_PROVIDER_KEY}:"))
-    && block.iter().any(|line| line.trim() == format!("api: {base}"))
+  root.get("providers")
+    .and_then(|providers| providers.get(HERMES_PROVIDER_KEY))
+    .and_then(|provider| provider.get("api"))
+    .and_then(serde_yaml::Value::as_str)
+    == Some(hive_openai_base_url().as_str())
 }
 
 // Configured only when every home (default + profiles) carries the provider.
@@ -3207,22 +3529,131 @@ fn hermes_configured_in(home: &Path) -> bool {
   hermes_configured_at(&hermes_root_in(home))
 }
 
+// Hermes' pickers list its whole effort ladder (minimal…ultra), but the Hive
+// gateway only accepts low/medium/xhigh and answers 502 for the rest. The
+// sanctioned extension point is a user plugin under $HERMES_HOME/plugins, which
+// overrides the bundled "custom" provider by name: declaring the narrow set
+// makes Hermes' own clamp map every pick onto the nearest supported level
+// (minimal→low, high→medium, max/ultra→xhigh) instead of forwarding it.
+const HERMES_EFFORT_PLUGIN_MANIFEST: &str = "\
+name: requrv-effort-map
+kind: model-provider
+version: 1.0.0
+description: ReQurv Hive - mappa gli effort di Hermes sui livelli accettati dal gateway (low, medium, xhigh)
+author: ReQurv
+";
+
+const HERMES_EFFORT_PLUGIN: &str = r#""""ReQurv Hive: map the effort levels the gateway rejects onto the three it accepts.
+
+Hermes' pickers list the whole internal ladder (minimal, low, medium, high,
+xhigh, max, ultra), but the Hive gateway only supports low, medium and xhigh
+and answers 502 for anything else. This profile replaces the bundled ``custom``
+provider, so the shared clamp maps every pick onto the nearest supported level
+(minimal -> low, high -> medium, max/ultra -> xhigh) instead of forwarding it.
+"""
+
+from typing import Any
+
+from agent.reasoning_effort import clamp_effort
+from providers import register_provider
+from providers.base import ProviderProfile
+
+# "none" keeps "Disable reasoning" working; the rest is what the gateway accepts.
+SUPPORTED_EFFORTS = ("none", "low", "medium", "xhigh")
+
+
+class RequrvProfile(ProviderProfile):
+    """Custom-provider profile for AI Hive: narrow effort vocabulary, medium default."""
+
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
+        return SUPPORTED_EFFORTS
+
+    def default_reasoning_config(self, model: str | None = None) -> dict | None:
+        return {"enabled": True, "effort": "medium"}
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, ollama_num_ctx: int | None = None, **ctx: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        top_level: dict[str, Any] = {}
+        if isinstance(reasoning_config, dict):
+            effort = str(reasoning_config.get("effort") or "").strip().lower()
+            if effort == "none" or reasoning_config.get("enabled", True) is False:
+                top_level["reasoning_effort"] = "none"
+            elif effort:
+                top_level["reasoning_effort"] = clamp_effort(effort, SUPPORTED_EFFORTS)
+        return {}, top_level
+
+
+requrv = RequrvProfile(
+    # Same name as the bundled profile: user plugins win on collision.
+    name="custom",
+    aliases=("ollama", "local", "vllm", "llamacpp", "llama.cpp", "llama-cpp"),
+    env_vars=(),
+    base_url="",
+)
+
+register_provider(requrv)
+"#;
+
+fn hermes_effort_plugin_dir(home: &Path) -> PathBuf {
+  home.join("plugins").join("model-providers").join("requrv")
+}
+
+fn install_hermes_effort_plugin(home: &Path) -> Result<(), String> {
+  let dir = hermes_effort_plugin_dir(home);
+  std::fs::create_dir_all(&dir)
+    .map_err(|e| format!("Impossibile creare il plugin degli effort ({}): {e}", dir.display()))?;
+  std::fs::write(dir.join("__init__.py"), HERMES_EFFORT_PLUGIN)
+    .map_err(|e| format!("Impossibile scrivere il plugin degli effort: {e}"))?;
+  std::fs::write(dir.join("plugin.yaml"), HERMES_EFFORT_PLUGIN_MANIFEST)
+    .map_err(|e| format!("Impossibile scrivere il plugin degli effort: {e}"))?;
+  Ok(())
+}
+
+// Only our own plugin directory is touched: other user plugins stay untouched.
+fn remove_hermes_effort_plugin(home: &Path) {
+  let _ = std::fs::remove_dir_all(hermes_effort_plugin_dir(home));
+}
+
 // Back up (once, only while a file is not already ours) and rewrite each config
 // with the Hive provider and the selected model.
 fn write_hermes_config_at(root: &Path, model: &str, key: &str) -> Result<(), String> {
-  for path in hermes_config_paths_at(root) {
+  let paths = hermes_config_paths_at(root);
+  let mut updates = Vec::with_capacity(paths.len());
+  for path in paths {
     let raw = std::fs::read_to_string(&path).map_err(|_| {
       format!("Configurazione di Hermes non trovata ({}). Avvia Hermes una volta e riprova.", path.display())
     })?;
+    let updated = merge_hermes_provider(&raw, model, key, &path)?;
+    updates.push((path, raw, updated));
+  }
+  for (path, raw, updated) in updates {
     if !hermes_config_has_provider(&path) {
       let backup = backup_path_for(&path);
       if !backup.exists() {
-        let _ = std::fs::write(&backup, raw.as_str());
+        std::fs::write(&backup, raw.as_str())
+          .map_err(|e| format!("Backup di {} non riuscito: {e}", path.display()))?;
       }
     }
-    let updated = merge_hermes_provider(&raw, model, key);
     std::fs::write(&path, updated)
       .map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+  }
+  // One plugin per home: the default config's directory and every profile's.
+  for path in hermes_config_paths_at(root) {
+    if let Some(home) = path.parent() {
+      install_hermes_effort_plugin(home)?;
+    }
+  }
+  Ok(())
+}
+
+fn write_hermes_config_path(path: &Path, model: &str, key: &str) -> Result<(), String> {
+  let raw = std::fs::read_to_string(path)
+    .map_err(|e| format!("Impossibile leggere {}: {e}", path.display()))?;
+  let updated = merge_hermes_provider(&raw, model, key, path)?;
+  std::fs::write(path, updated).map_err(|e| format!("Impossibile scrivere {}: {e}", path.display()))?;
+  if let Some(home) = path.parent() {
+    install_hermes_effort_plugin(home)?;
   }
   Ok(())
 }
@@ -3235,6 +3666,9 @@ fn write_hermes_config_in(home: &Path, model: &str, key: &str) -> Result<(), Str
 // rewrite, for the default home and every profile.
 fn restore_hermes_config_at(root: &Path) -> Result<(), String> {
   for path in hermes_config_paths_at(root) {
+    if let Some(home) = path.parent() {
+      remove_hermes_effort_plugin(home);
+    }
     let backup = backup_path_for(&path);
     if !backup.exists() {
       continue;
@@ -3275,25 +3709,19 @@ fn spawn_hermes_app() -> Result<(), String> {
   }
   #[cfg(not(target_os = "macos"))]
   {
-    Command::new(&install)
-      .stdin(Stdio::null())
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .spawn()
-      .map(|_| ())
-      .map_err(|e| format!("Impossibile avviare Hermes: {e}"))
+    desktop_spawn_app(&install, &[], "Hermes")
   }
 }
 
-// Quit Hermes so the next launch can carry the AI Hive environment. Graceful
-// AppleScript quit on macOS, then a forced kill; best-effort pkill/taskkill
+// Quit Hermes so the next launch reads the updated config. Graceful AppleScript
+// quit on macOS, then a forced kill; best-effort pkill/taskkill
 // elsewhere. The wait mirrors the ChatGPT restart flow.
 #[cfg(target_os = "macos")]
-fn quit_hermes_app() {
+fn quit_hermes_app() -> Result<(), String> {
   let app_name = hermes_app_path()
     .and_then(|b| b.file_stem().map(|s| s.to_string_lossy().to_string()))
     .unwrap_or_else(|| String::from("HERMES-IDE"));
-  let _ = Command::new("osascript")
+  let _ = hidden_command("osascript")
     .args(["-e", &format!("tell application \"{app_name}\" to quit")])
     .stdin(Stdio::null())
     .stdout(Stdio::null())
@@ -3301,12 +3729,12 @@ fn quit_hermes_app() {
     .spawn();
   for _ in 0..20 {
     if !hermes_app_running() {
-      return;
+      return Ok(());
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
   }
-  for name in ["HERMES-IDE", "hermes-ide", "hermes"] {
-    let _ = Command::new("pkill")
+  for name in ["Hermes", "HERMES-IDE", "hermes-ide"] {
+    let _ = hidden_command("pkill")
       .arg("-x")
       .arg(name)
       .stdin(Stdio::null())
@@ -3316,34 +3744,41 @@ fn quit_hermes_app() {
   }
   for _ in 0..10 {
     if !hermes_app_running() {
-      return;
+      return Ok(());
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
   }
+  if hermes_app_running() {
+    return Err("Impossibile chiudere Hermes prima del riavvio".into());
+  }
+  Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn quit_hermes_app() {
+fn quit_hermes_app() -> Result<(), String> {
   // Kill only the detected desktop app's own image name; on Linux there is no
   // desktop app so this is a no-op (it must never take down the CLI).
   let Some(bin) = hermes_app_path() else {
-    return;
+    return Ok(());
   };
   let Some(name) = bin.file_name().and_then(|n| n.to_str()) else {
-    return;
+    return Err("Impossibile identificare il processo Hermes".into());
   };
   desktop_process_quit(&[name]);
   for _ in 0..10 {
     if !hermes_app_running() {
-      return;
+      return Ok(());
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
   }
+  if hermes_app_running() {
+    return Err("Impossibile chiudere Hermes prima del riavvio".into());
+  }
+  Ok(())
 }
 
-// Launch Hermes on AI Hive: env vars only, nothing persisted. If an instance
-// is already running it cannot receive the environment, so the caller (the
-// frontend) asks for a restart confirmation before invoking restart_hermes_app.
+// Configure Hermes persistently for AI Hive. If an instance is already running,
+// the frontend asks for a restart confirmation before invoking restart_hermes_app.
 #[tauri::command]
 pub async fn launch_hermes_app(model: String, key: String) -> Result<AppRestartResult, String> {
   let model = model.trim();
@@ -3367,24 +3802,19 @@ pub async fn launch_hermes_app(model: String, key: String) -> Result<AppRestartR
   Ok(AppRestartResult { restart_required: false })
 }
 
-// Quit the running instance (if any) and relaunch it so it loads the config
-// written above.
+// Restart the current Hermes configuration after the caller has configured or
+// restored it. This command is deliberately config-neutral.
 #[tauri::command]
-pub fn restart_hermes_app(model: String, key: String) -> Result<(), String> {
-  let model = model.trim();
-  let key = key.trim();
-  if model.is_empty() {
-    return Err("Nessun modello selezionato".into());
-  }
-  if key.is_empty() {
-    return Err("Chiave Hive non salvata".into());
-  }
+pub fn restart_hermes_app() -> Result<(), String> {
   if hermes_app_path().is_none() {
     return Err(format!("Hermes non è installato. Scaricalo da {HERMES_DOWNLOAD_URL}."));
   }
-  let home = home_dir().ok_or_else(|| "Home directory non trovata".to_string())?;
-  write_hermes_config_in(&home, model, key)?;
-  quit_hermes_app();
+  quit_hermes_app()?;
+  spawn_hermes_app()
+}
+
+#[tauri::command]
+pub fn open_hermes_app() -> Result<(), String> {
   spawn_hermes_app()
 }
 
@@ -3394,37 +3824,19 @@ fn shell_quote(value: &str) -> String {
   format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-// Build a bash script that sets the Hive env vars and runs the CLI so the
-// terminal window stays attached to the process (TUI apps need a real TTY).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// Delegate script construction to the portable terminal adapter.
+#[cfg(any(target_os = "macos", test))]
 fn build_terminal_script(
   bin: &Path,
   args: &[String],
   env: &[(&str, &str)],
   working_directory: &Path,
 ) -> String {
-  let mut out = format!(
-    "#!/bin/bash\ncd -- {}\n",
-    shell_quote(&working_directory.to_string_lossy()),
-  );
-  for (name, value) in env {
-    out.push_str(&format!("export {name}={}\n", shell_quote(value)));
-  }
-  let mut command = shell_quote(&bin.to_string_lossy());
-  for arg in args {
-    command.push(' ');
-    command.push_str(&shell_quote(arg));
-  }
-  out.push_str(&command);
-  out.push_str(
-    "\necho \"\"\necho \"Processo terminato (exit code: $?). Premi Invio per chiudere la finestra.\"\nread -r _\n",
-  );
-  out
+  crate::terminal::build_posix_script(bin, args, env, working_directory)
 }
 
-// Single entry point for launching a CLI: on macOS the agents are TUI apps
-// that need a terminal, so we hand a .command script to the system's default
-// terminal via `open`; elsewhere we keep the detached spawn.
+// CLI tools need a real terminal on macOS and Windows. Linux retains its
+// existing process launcher.
 fn launch_cli(
   app: &tauri::AppHandle,
   service: &str,
@@ -3438,7 +3850,18 @@ fn launch_cli(
     let script = build_terminal_script(bin, args, env, working_directory);
     open_terminal_script(app, service, &script)
   }
-  #[cfg(not(target_os = "macos"))]
+  #[cfg(windows)]
+  {
+    let directory = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    crate::terminal::launch_windows(
+      &directory.join(format!("launch-{service}.ps1")),
+      bin,
+      args,
+      env,
+      working_directory,
+    )
+  }
+  #[cfg(target_os = "linux")]
   {
     let _ = (app, service);
     spawn_cli(bin, args, env, working_directory)
@@ -3461,7 +3884,7 @@ fn open_terminal_script(app: &tauri::AppHandle, service: &str, script: &str) -> 
     "tell application \"Terminal\"\n  activate\n  do script \"bash {}\"\nend tell\n",
     applescript_escape(&shell_quote(&path.to_string_lossy())),
   );
-  let mut child = Command::new("osascript")
+  let mut child = hidden_command("osascript")
     .stdin(Stdio::piped())
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -3488,59 +3911,21 @@ fn applescript_escape(value: &str) -> String {
   value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[cfg(windows)]
-const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-
-#[cfg(windows)]
-fn is_shell_shim(path: &Path) -> bool {
-  path.extension()
-    .and_then(|e| e.to_str())
-    .is_some_and(|e| matches!(e.to_lowercase().as_str(), "cmd" | "bat" | "ps1"))
-}
-
-#[cfg(windows)]
-fn is_powershell_shim(path: &Path) -> bool {
-  path.extension()
-    .and_then(|e| e.to_str())
-    .is_some_and(|e| e.to_lowercase().as_str() == "ps1")
-}
-
-// On macOS every launch goes through the terminal script; the detached spawn
-// is the fallback for Windows (new console) and Linux.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+// Existing Linux fallback. macOS and Windows use interactive terminal hosts.
+#[cfg(target_os = "linux")]
 fn spawn_cli(
   bin: &Path,
   args: &[String],
   env: &[(&str, &str)],
   working_directory: &Path,
 ) -> Result<(), String> {
-  let mut command = Command::new(bin);
-  #[cfg(windows)]
-  if is_shell_shim(bin) {
-    if is_powershell_shim(bin) {
-      command = Command::new("powershell.exe");
-      command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
-      command.arg(bin);
-    } else {
-      command = Command::new("cmd");
-      command.arg("/c");
-      command.arg(bin);
-    }
-  }
-  command.current_dir(working_directory);
-  command.args(args);
-  command.stdin(Stdio::null());
-  command.stdout(Stdio::null());
-  command.stderr(Stdio::null());
-  for (name, value) in env {
-    command.env(name, value);
-  }
-  #[cfg(windows)]
-  {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(CREATE_NEW_CONSOLE);
-  }
-  command
+  hidden_command(bin)
+    .current_dir(working_directory)
+    .args(args)
+    .envs(env.iter().copied())
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
     .spawn()
     .map_err(|e| format!("Avvio non riuscito: {e}"))?;
   Ok(())
@@ -3925,9 +4310,46 @@ pub fn delete_mcp_server(app: tauri::AppHandle, id: String) -> Result<(), String
 mod tests {
   use super::*;
 
+  // Claude Desktop uses a separate Windows root under %LOCALAPPDATA%; keep
+  // the conventional app-support root unchanged for other integrations.
+  #[test]
+  fn claude_desktop_windows_root_uses_local_app_data_only_for_claude() {
+    let home = PathBuf::from("C:/Users/bridge");
+    let root = claude_desktop_data_root_for(&home, Some("C:/Users/bridge/AppData/Local"), true);
+    assert_eq!(root, PathBuf::from("C:/Users/bridge/AppData/Local"));
+    assert_eq!(
+      root.join("Claude-3p"),
+      PathBuf::from("C:/Users/bridge/AppData/Local/Claude-3p")
+    );
+    assert_eq!(
+      claude_desktop_data_root_for(&home, None, true),
+      home.join("AppData").join("Local")
+    );
+  }
+
+  #[test]
+  fn hermes_default_roots_match_platform_and_explicit_override() {
+    let home = PathBuf::from("C:/Users/bridge");
+    assert_eq!(
+      hermes_root_for_platform(&home, None, Some("C:/Users/bridge/AppData/Local"), true),
+      PathBuf::from("C:/Users/bridge/AppData/Local/hermes")
+    );
+    assert_eq!(
+      hermes_root_for_platform(&home, None, None, true),
+      home.join("AppData").join("Local").join("hermes")
+    );
+    assert_eq!(
+      hermes_root_for_platform(&home, None, None, false),
+      home.join(".hermes")
+    );
+    assert_eq!(
+      hermes_root_for_platform(&home, Some("D:/custom-hermes"), Some("C:/local"), true),
+      PathBuf::from("D:/custom-hermes")
+    );
+  }
+
   // La radice dove un'app desktop tiene i dati utente è la base su cui Claude
-  // Desktop aggancia i suoi path di config; su macOS deve restare l'intero
-  // "Application Support" stabile, invariato rispetto al passato.
+  // Desktop aggancia i suoi path di config; su macOS resta Application Support.
   #[cfg(target_os = "macos")]
   #[test]
   fn application_support_root_macos_is_application_support() {
@@ -3957,7 +4379,8 @@ mod tests {
   }
 
   // L'installer Windows attuale pone l'app nella directory a scope npm
-  // "@opencode-aidesktop": la ricerca deve risolversi anche con quel layout.
+  // "@opencode-aidesktop", il più recente nella directory reverse-DNS
+  // "ai.opencode.desktop": la ricerca deve risolversi con entrambi i layout.
   #[test]
   fn opencode_app_path_in_finds_scoped_installer_dir() {
     let tmp =
@@ -3971,6 +4394,76 @@ mod tests {
     // Una root senza installazione non deve risolversi a nulla.
     assert_eq!(opencode_app_path_in(&[tmp.join("vuoto")]), None);
     let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // L'installer per-utente verificato su Windows usa il nome reverse-DNS
+  // "ai.opencode.desktop" sotto %LOCALAPPDATA%\Programs.
+  #[test]
+  fn opencode_app_path_in_finds_reverse_dns_installer_dir() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-bridge-test-opencode-dns-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let dns = tmp.join("ai.opencode.desktop");
+    std::fs::create_dir_all(&dns).unwrap();
+    std::fs::write(dns.join("OpenCode.exe"), "stub").unwrap();
+    assert_eq!(opencode_app_path_in(&[tmp.clone()]), Some(dns.join("OpenCode.exe")));
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // Un bridge avviato da un host Electron (terminale di VS Code, harness)
+  // eredita ELECTRON_RUN_AS_NODE=1: il figlio Electron partirebbe come Node ed
+  // uscirebbe senza finestra, quindi lo spawn deve rimuovere la variabile.
+  #[cfg(any(windows, target_os = "linux"))]
+  #[test]
+  fn desktop_app_spawn_drops_electron_node_mode() {
+    let command = desktop_app_command(Path::new("OpenCode.exe"), &[("HIVE_MODEL", "requrv-small-3.8")]);
+    let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = command
+      .get_envs()
+      .map(|(name, value)| (name.to_owned(), value.map(|value| value.to_owned())))
+      .collect();
+    assert!(envs
+      .iter()
+      .any(|(name, value)| name == "ELECTRON_RUN_AS_NODE" && value.is_none()));
+    assert!(envs.iter().any(|(name, value)| name == "HIVE_MODEL"
+      && value.as_deref() == Some(std::ffi::OsStr::new("requrv-small-3.8"))));
+  }
+
+  // Il PATH di un processo avviato da Explorer può essere vecchio o ridotto:
+  // entrambi gli hive vanno uniti, macchina prima e utente dopo, altrimenti
+  // spariscono le installazioni per-utente (prefisso npm, bun, shim locali).
+  #[test]
+  fn merged_registry_path_keeps_machine_and_user_entries() {
+    assert_eq!(
+      merged_registry_path(Some("C:\\Windows\\system32"), Some("C:\\Users\\u\\AppData\\Roaming\\npm")),
+      Some("C:\\Windows\\system32;C:\\Users\\u\\AppData\\Roaming\\npm".to_string())
+    );
+    assert_eq!(
+      merged_registry_path(None, Some(" C:\\Users\\u\\.bun\\bin ")),
+      Some("C:\\Users\\u\\.bun\\bin".to_string())
+    );
+    assert_eq!(
+      merged_registry_path(Some("C:\\Windows"), None),
+      Some("C:\\Windows".to_string())
+    );
+    assert_eq!(merged_registry_path(None, None), None);
+    assert_eq!(merged_registry_path(Some("  "), Some("")), None);
+  }
+
+  // Sonda manuale: stampa ciò che «Rileva» vede sulla macchina corrente. È
+  // ignorata perché dipende dall'installazione reale, non dalla logica.
+  #[test]
+  #[ignore]
+  fn detection_probe_real_machine() {
+    println!("{}", serde_json::to_string_pretty(&check_services()).unwrap());
+    for service in ["opencode", "codex", "claude", "hermes"] {
+      println!("{service}: {:?}", find_service_binary(service));
+    }
+    println!("opencode app: {:?}", opencode_app_path());
+    println!("chatgpt app: {:?}", chatgpt_app_bundle());
+    println!("claude desktop app: {:?}", claude_desktop_app_path());
+    println!("hermes app: {:?}", hermes_app_path());
+    println!("hermes cli: {:?}", hermes_cli_path());
+    println!("codex app binary: {:?}", codex_app_binary());
   }
 
   // Nel manifest il contenitore <Applications> va saltato e gli attributi
@@ -4011,6 +4504,26 @@ mod tests {
     // Idempotente: cancellare di nuovo non deve fallire.
     delete_key_files(&path).unwrap();
     let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  #[test]
+  fn verified_hive_model_preserves_valid_choice_or_chooses_text_fallback() {
+    let models = vec![
+      HiveModel { id: "image-model".into(), model_type: "IMAGE_GENERATION".into() },
+      HiveModel { id: "text-one".into(), model_type: "TEXT_GENERATION".into() },
+      HiveModel { id: "text-two".into(), model_type: "TEXT_GENERATION".into() },
+    ];
+    assert_eq!(verified_hive_model("text-two", &models).as_deref(), Some("text-two"));
+    assert_eq!(verified_hive_model("removed-model", &models).as_deref(), Some("text-one"));
+    assert_eq!(verified_hive_model("", &models).as_deref(), Some("text-one"));
+    assert_eq!(verified_hive_model("", &[]), None);
+    assert_eq!(
+      verified_hive_model(
+        "",
+        &[HiveModel { id: "image-model".into(), model_type: "IMAGE_GENERATION".into() }]
+      ),
+      None
+    );
   }
 
   // Il riallineamento scrive la chiave nuova solo nei target già configurati e
@@ -4062,6 +4575,43 @@ mod tests {
     assert_eq!(std::fs::read_to_string(opencode_config_path_in(&tmp)).unwrap(), user_opencode);
     assert!(!opencode_configured_in(&tmp));
     let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  #[test]
+  fn reapply_updates_managed_hermes_profiles_and_claude_desktop_only() {
+    let home = std::env::temp_dir().join(format!("requrv-reapply-harnesses-{}", std::process::id()));
+    let hermes_root = home.join("hermes");
+    let profile = hermes_root.join("profiles").join("developer");
+    let untouched = hermes_root.join("profiles").join("untouched");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::create_dir_all(&untouched).unwrap();
+    let original = "model:\n  temperature: 0.5\n";
+    let root_config = hermes_config_path_at(&hermes_root);
+    let managed_profile = hermes_config_path_at(&profile);
+    let untouched_profile = hermes_config_path_at(&untouched);
+    std::fs::create_dir_all(&hermes_root).unwrap();
+    std::fs::write(&root_config, original).unwrap();
+    std::fs::write(&untouched_profile, original).unwrap();
+    let managed = merge_hermes_provider(original, "model-old", "requrv_sk_old", &managed_profile).unwrap();
+    std::fs::write(&managed_profile, managed).unwrap();
+    configure_claude_desktop_in(&home, "model-old", "requrv_sk_old").unwrap();
+
+    let failures = reapply_persisted_configs_at(&home, &hermes_root, "model-new", "requrv_sk_new", &[]);
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let updated: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&managed_profile).unwrap()).unwrap();
+    assert_eq!(updated["model"]["default"], "model-new");
+    assert_eq!(updated["providers"]["requrv"]["api_key"], "requrv_sk_new");
+    assert_eq!(std::fs::read_to_string(&root_config).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&untouched_profile).unwrap(), original);
+
+    let paths = claude_desktop_paths_in(&home);
+    let profile: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&paths.profile).unwrap()).unwrap();
+    assert_eq!(profile["inferenceGatewayApiKey"], "requrv_sk_new");
+    assert_eq!(profile["inferenceModels"][0]["labelOverride"], "model-new (ReQurv)");
+    assert!(!backup_path_for(&paths.profile).exists(), "reapply never snapshots the Hive profile as original");
+    let _ = std::fs::remove_dir_all(&home);
   }
 
   #[test]
@@ -4123,10 +4673,10 @@ mod tests {
       &[("OPENCODE_CONFIG_CONTENT", "{\"model\":\"hive/x\"}")],
       Path::new("/Users/x/Projects/it's fine"),
     );
-    assert!(script.starts_with("#!/bin/bash\ncd -- '/Users/x/Projects/it'\\''s fine'\n"));
+    assert!(script.starts_with("#!/bin/bash\ncd -- '/Users/x/Projects/it'\\''s fine' || exit $?\n"));
     assert!(script.contains(r#"export OPENCODE_CONFIG_CONTENT='{"model":"hive/x"}'"#));
     assert!(script.contains("'/opt/homebrew/bin/opencode'"));
-    assert!(script.ends_with("read -r _\n"));
+    assert!(script.ends_with("read -r _\nexit \"$status\"\n"));
   }
 
   // La CLI codex non riceve argomenti; CODEX_HOME è pinnato (la shell può
@@ -4165,7 +4715,7 @@ mod tests {
     assert!(script.contains("export ANTHROPIC_API_KEY='sk-test'"));
     assert!(script.contains("export ANTHROPIC_MODEL='model-a'"));
     assert!(script.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS='128000'"));
-    assert!(script.contains("'/Users/x/.local/bin/claude'\necho \"\""));
+    assert!(script.contains("'/Users/x/.local/bin/claude'\nstatus=$?\necho \"\""));
   }
 
   // La configurazione vive nel file: il merge conserva hooks, theme e le chiavi
@@ -4311,17 +4861,26 @@ mod tests {
     write_hermes_config_at(&root, "requrv-small-3.8", "requrv_sk_test").unwrap();
     for path in [&root_path, &profile_path] {
       let written = std::fs::read_to_string(path).unwrap();
-      assert!(written.contains("  provider: custom:requrv\n"), "{path:?}");
-      assert!(written.contains("  default: requrv-small-3.8\n"), "{path:?}");
-      assert!(written.contains(&format!("  base_url: {}\n", hive_openai_base_url())), "{path:?}");
-      assert!(written.contains("providers:\n  requrv:\n    name: ReQurv\n"), "{path:?}");
-      assert!(written.contains("    api_key: requrv_sk_test\n"), "{path:?}");
-      assert!(written.contains("      requrv-small-3.8: {}\n"), "{path:?}");
-      // Il resto del file resta intatto.
-      assert!(written.contains("database:\n  journal_mode: wal\n"), "{path:?}");
-      assert!(written.contains("custom_providers: []\n"), "{path:?}");
+      let parsed: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
+      assert_eq!(parsed["model"]["provider"], "custom:requrv");
+      assert_eq!(parsed["model"]["default"], "requrv-small-3.8");
+      assert_eq!(parsed["model"]["base_url"], hive_openai_base_url());
+      assert_eq!(parsed["providers"]["requrv"]["name"], "ReQurv");
+      assert_eq!(parsed["providers"]["requrv"]["api_key"], "requrv_sk_test");
+      assert!(parsed["providers"]["requrv"]["models"].get("requrv-small-3.8").is_some());
+      // Il ragionamento è pinnato al livello minimo attivo: la CLI pensa meno.
+      assert_eq!(parsed["agent"]["reasoning_effort"], "medium");
+      assert_eq!(parsed["database"]["journal_mode"], "wal");
+      assert_eq!(parsed["custom_providers"], serde_yaml::Value::Sequence(vec![]));
     }
     assert!(hermes_configured_at(&root));
+
+    // Il plugin che mappa gli effort viene scritto in ogni home (default e profili).
+    let plugin_dir = hermes_effort_plugin_dir(&root);
+    let profile_plugin_dir = hermes_effort_plugin_dir(&profile_dir);
+    assert!(plugin_dir.join("__init__.py").is_file());
+    assert!(plugin_dir.join("plugin.yaml").is_file());
+    assert!(profile_plugin_dir.join("__init__.py").is_file());
 
     // Il ripristino torna all'originale su ogni home e rimuove i backup.
     restore_hermes_config_at(&root).unwrap();
@@ -4329,7 +4888,50 @@ mod tests {
       assert_eq!(std::fs::read_to_string(path).unwrap(), original);
       assert!(!backup_path_for(path).exists());
     }
+    assert!(!plugin_dir.exists());
+    assert!(!profile_plugin_dir.exists());
     assert!(!hermes_configured_at(&root));
+    let _ = std::fs::remove_dir_all(&root);
+  }
+
+  #[test]
+  fn hermes_merge_preserves_model_options_and_other_providers_and_adds_missing_model() {
+    let root = std::env::temp_dir().join(format!("requrv-hermes-merge-{}", std::process::id()));
+    let path = root.join("config.yaml");
+    let raw = "database:\n  journal_mode: wal\nagent:\n  max_turns: 7\nproviders:\n  openai: {name: OpenAI}\nmodel:\n  temperature: 0.25\n  extra: keep\n";
+    let merged = merge_hermes_provider(raw, "model with spaces:latest", "key: with spaces", &path).unwrap();
+    let value: serde_yaml::Value = serde_yaml::from_str(&merged).unwrap();
+    assert_eq!(value["model"]["temperature"], 0.25);
+    assert_eq!(value["model"]["extra"], "keep");
+    assert_eq!(value["agent"]["max_turns"], 7);
+    assert_eq!(value["agent"]["reasoning_effort"], "medium");
+    assert_eq!(value["model"]["default"], "model with spaces:latest");
+    assert_eq!(value["providers"]["openai"]["name"], "OpenAI");
+    assert_eq!(value["providers"]["requrv"]["api_key"], "key: with spaces");
+    assert!(value["providers"]["requrv"]["models"].get("model with spaces:latest").is_some());
+  }
+
+  // Il plugin embedded deve dichiarare solo i livelli che il gateway accetta:
+  // il clamp di Hermes mappa lì tutti gli altri (max e ultra compresi).
+  #[test]
+  fn hermes_effort_plugin_declares_only_gateway_levels() {
+    assert!(HERMES_EFFORT_PLUGIN.contains(r#"SUPPORTED_EFFORTS = ("none", "low", "medium", "xhigh")"#));
+    assert!(HERMES_EFFORT_PLUGIN.contains("register_provider(requrv)"));
+    assert!(HERMES_EFFORT_PLUGIN.contains(r#"name="custom""#));
+  }
+
+  #[test]
+  fn hermes_refuses_malformed_yaml_without_rewriting_file_or_backup() {
+    let root = std::env::temp_dir().join(format!("requrv-hermes-invalid-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = hermes_config_path_at(&root);
+    let malformed = "model: [unfinished\n";
+    std::fs::write(&path, malformed).unwrap();
+    let result = write_hermes_config_at(&root, "model-a", "requrv_sk_test");
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
+    assert!(!backup_path_for(&path).exists());
     let _ = std::fs::remove_dir_all(&root);
   }
 
@@ -4401,26 +5003,97 @@ mod tests {
     let _ = std::fs::remove_dir_all(&tmp);
   }
 
+  // Su Windows lo stesso checkout produce release/win-unpacked/Hermes.exe: è
+  // l'installazione "git", che non passa da %LOCALAPPDATA%\Programs.
+  #[test]
+  fn finds_hermes_app_in_the_checkout_win_unpacked() {
+    let tmp =
+      std::env::temp_dir().join(format!("requrv-bridge-test-hermes-win-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let unpacked = tmp
+      .join("hermes-agent")
+      .join("apps")
+      .join("desktop")
+      .join("release")
+      .join("win-unpacked");
+    std::fs::create_dir_all(&unpacked).expect("create fake win-unpacked");
+    std::fs::write(unpacked.join("Hermes.exe"), "stub").expect("write fake exe");
+    assert_eq!(
+      hermes_checkout_app_path_in(&tmp),
+      Some(unpacked.join("Hermes.exe"))
+    );
+    assert_eq!(hermes_checkout_app_path_in(&tmp.join("vuoto")), None);
+    let _ = std::fs::remove_dir_all(&tmp);
+  }
+
+  // La CLI del checkout vive in bin/, quella dell'installer pacchettizzato nel
+  // venv: entrambe le forme devono comparire tra i candidati.
+  #[test]
+  fn hermes_windows_cli_candidates_cover_bin_and_venv() {
+    let root = Path::new("C:\\Users\\u\\AppData\\Local\\hermes");
+    let candidates = hermes_windows_cli_candidates(&[root.to_path_buf()]);
+    assert!(candidates.contains(&root.join("bin").join("hermes.exe")));
+    assert!(candidates.contains(
+      &root
+        .join("hermes-agent")
+        .join("venv")
+        .join("Scripts")
+        .join("hermes.exe")
+    ));
+  }
+
   // Il gateway risponde 422 al POST di prova con corpo vuoto (validazione del
   // body prima dell'invocazione del modello): qualsiasi 4xx dal handler prova
-  // che il percorso esiste. Solo 404 e 5xx bloccano l'avvio.
   #[test]
-  fn probe_treats_handler_rejections_as_available() {
-    for status in [
-      reqwest::StatusCode::OK,
-      reqwest::StatusCode::UNAUTHORIZED,
-      reqwest::StatusCode::FORBIDDEN,
-      reqwest::StatusCode::METHOD_NOT_ALLOWED,
-      reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-      reqwest::StatusCode::TOO_MANY_REQUESTS,
-    ] {
-      assert_eq!(probe_error(status, "Codex", "/responses"), None, "status {status}");
+  fn probe_accepts_validation_but_rejects_auth_throttling_and_wrong_routes() {
+    for code in [200, 204, 400, 422] {
+      assert_eq!(probe_error(reqwest::StatusCode::from_u16(code).unwrap(), "Codex", "/responses"), None);
     }
-    let missing = probe_error(reqwest::StatusCode::NOT_FOUND, "Claude Code", "/messages").expect("404");
-    assert!(missing.contains("Claude Code"));
-    assert!(missing.contains("/messages"));
-    assert!(probe_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "Codex", "/responses").is_some());
-    assert!(probe_error(reqwest::StatusCode::BAD_GATEWAY, "Codex", "/responses").is_some());
+    for code in [301, 302, 401, 403, 404, 405, 408, 429, 500, 502] {
+      let error = probe_error(reqwest::StatusCode::from_u16(code).unwrap(), "Codex", "/responses").unwrap();
+      assert!(error.contains("Codex"));
+      assert!(error.contains("/responses"));
+      assert!(error.contains(&code.to_string()));
+    }
+  }
+
+  #[test]
+  fn probe_uses_the_clients_auth_scheme_and_normalizes_base_slash() {
+    let client = reqwest::Client::new();
+    let anthropic = endpoint_probe_request(&client, "https://example.test/api/", " key ", "/v1/messages").build().unwrap();
+    assert_eq!(anthropic.url().as_str(), "https://example.test/api/v1/messages");
+    assert_eq!(anthropic.headers()["x-api-key"], "key");
+    assert_eq!(anthropic.headers()["anthropic-version"], "2023-06-01");
+    assert!(!anthropic.headers().contains_key("authorization"));
+    for endpoint in ["/responses", "/chat/completions"] {
+      let request = endpoint_probe_request(&client, "https://example.test/api/v1", "key", endpoint).build().unwrap();
+      assert_eq!(request.headers()["authorization"], "Bearer key");
+      assert!(!request.headers().contains_key("x-api-key"));
+      assert_eq!(request.method(), reqwest::Method::POST);
+    }
+  }
+
+  // L'installer nativo di Claude Code non tocca il PATH: su Windows lascia
+  // claude.exe in %USERPROFILE%\.local\bin, quindi la sola ricerca sul PATH
+  // dichiarerebbe la CLI assente. La lista dei candidati deve coprirlo.
+  #[test]
+  fn claude_candidates_cover_native_install_and_npm_shims() {
+    let home = Path::new("/home/u");
+    let native = home.join(".local").join("bin");
+    let appdata = Path::new("/home/u/AppData/Roaming");
+
+    let windows = claude_cli_candidates(home, Some(appdata), true);
+    assert_eq!(windows.first(), Some(&native.join("claude.exe")));
+    assert!(windows.contains(&native.join("claude.cmd")));
+    assert!(windows.contains(&appdata.join("npm").join("claude.cmd")));
+    assert!(windows.contains(&appdata.join("npm").join("claude.exe")));
+    // Lo shim senza estensione è uno script bash su Windows: non va proposto
+    // come eseguibile, altrimenti il lancio fallirebbe dopo il rilevamento.
+    assert!(!windows.contains(&native.join("claude")));
+
+    let posix = claude_cli_candidates(home, None, false);
+    assert_eq!(posix.first(), Some(&native.join("claude")));
+    assert!(!posix.contains(&native.join("claude.exe")));
   }
 
   // Simula un processo con PATH vecchio/stripped (es. app lanciata da un
@@ -4428,6 +5101,13 @@ mod tests {
   // rilevazione deve comunque funzionare leggendo il PATH dal registry.
   #[test]
   fn finds_opencode_with_stale_path() {
+    // Serve un'installazione reale di opencode da trovare: senza, il fallback
+    // non ha nulla da risolvere e il test misurerebbe solo la macchina. Dove la
+    // CLI c'è (le immagini CI la includono) l'asserzione resta attiva.
+    if find_service_binary("opencode").is_none() {
+      println!("opencode non installato: verifica del PATH dal registry saltata");
+      return;
+    }
     let original = std::env::var("PATH").unwrap_or_default();
     std::env::set_var(
       "PATH",
@@ -4931,6 +5611,83 @@ mod tests {
   }
 
   #[test]
+  fn chatgpt_restore_recovers_missing_auth_and_original_catalog() {
+    let home = std::env::temp_dir().join(format!("requrv-codex-missing-auth-{}", std::process::id()));
+    let dir = codex_dir_in(&home);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    let original_auth = r#"{"auth_mode":"chatgpt"}"#;
+    let original_catalog = r#"{"models":[{"slug":"user-model"}]}"#;
+    std::fs::write(codex_auth_path_in(&home), original_auth).unwrap();
+    std::fs::write(codex_catalog_path_in(&home), original_catalog).unwrap();
+    let models = vec![HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() }];
+    configure_chatgpt_app_in(&home, "model-a", &models, "requrv_sk_test").unwrap();
+    assert_eq!(std::fs::read_to_string(codex_catalog_backup_path_in(&home)).unwrap(), original_catalog);
+    std::fs::remove_file(codex_auth_path_in(&home)).unwrap();
+
+    restore_chatgpt_app_in(&home, "requrv_sk_test").unwrap();
+    assert_eq!(std::fs::read_to_string(codex_auth_path_in(&home)).unwrap(), original_auth);
+    assert_eq!(std::fs::read_to_string(codex_catalog_path_in(&home)).unwrap(), original_catalog);
+    assert!(!codex_catalog_backup_path_in(&home).exists());
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
+  fn chatgpt_restore_keeps_new_oauth_login_instead_of_stale_backup() {
+    let home = std::env::temp_dir().join(format!("requrv-codex-new-login-{}", std::process::id()));
+    let dir = codex_dir_in(&home);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    let original_auth = r#"{"auth_mode":"chatgpt"}"#;
+    std::fs::write(codex_auth_path_in(&home), original_auth).unwrap();
+    let models = vec![HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() }];
+    configure_chatgpt_app_in(&home, "model-a", &models, "requrv_sk_test").unwrap();
+    let newer_login = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"new"}}"#;
+    std::fs::write(codex_auth_path_in(&home), newer_login).unwrap();
+
+    restore_chatgpt_app_in(&home, "requrv_sk_test").unwrap();
+    assert_eq!(std::fs::read_to_string(codex_auth_path_in(&home)).unwrap(), newer_login);
+    assert!(!codex_auth_backup_path_in(&home).exists());
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
+  fn chatgpt_restore_keeps_auth_backup_when_current_auth_is_malformed() {
+    let home = std::env::temp_dir().join(format!("requrv-codex-bad-auth-{}", std::process::id()));
+    let dir = codex_dir_in(&home);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(codex_auth_path_in(&home), r#"{"auth_mode":"chatgpt"}"#).unwrap();
+    let models = vec![HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() }];
+    configure_chatgpt_app_in(&home, "model-a", &models, "requrv_sk_test").unwrap();
+    let backup = std::fs::read_to_string(codex_auth_backup_path_in(&home)).unwrap();
+    std::fs::write(codex_auth_path_in(&home), "not JSON").unwrap();
+
+    assert!(restore_chatgpt_app_in(&home, "requrv_sk_test").is_err());
+    assert_eq!(std::fs::read_to_string(codex_auth_backup_path_in(&home)).unwrap(), backup);
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
+  fn chatgpt_bad_config_fails_before_catalog_write() {
+    let home = std::env::temp_dir().join(format!("requrv-codex-bad-config-{}", std::process::id()));
+    let dir = codex_dir_in(&home);
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad_config = "model = [not valid";
+    let original_catalog = "user-owned catalog";
+    std::fs::write(codex_config_path_in(&home), bad_config).unwrap();
+    std::fs::write(codex_catalog_path_in(&home), original_catalog).unwrap();
+    let models = vec![HiveModel { id: "model-a".into(), model_type: "TEXT_GENERATION".into() }];
+
+    assert!(configure_chatgpt_app_in(&home, "model-a", &models, "requrv_sk_test").is_err());
+    assert_eq!(std::fs::read_to_string(codex_config_path_in(&home)).unwrap(), bad_config);
+    assert_eq!(std::fs::read_to_string(codex_catalog_path_in(&home)).unwrap(), original_catalog);
+    assert!(!codex_catalog_backup_path_in(&home).exists());
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
   fn configure_twice_keeps_the_original_backup() {
     let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-chatgpt-again-{}", std::process::id()));
     let dir = tmp.join(".codex");
@@ -5148,7 +5905,7 @@ mod tests {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("requrv-bridge-test-cd-{}-{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    let support = application_support_root(&tmp);
+    let support = claude_desktop_data_root_for(&tmp, None, cfg!(windows));
     std::fs::create_dir_all(support.join("Claude")).unwrap();
     std::fs::create_dir_all(support.join("Claude-3p")).unwrap();
     // Pre-existing user state that restore must bring back.
@@ -5222,8 +5979,65 @@ mod tests {
     // Remove the 3p config so the profile/meta are created from nothing.
     std::fs::remove_file(&paths.third_party_config).unwrap();
     configure_claude_desktop_in(&home, "model-a", "requrv_sk_test").unwrap();
+    // Reconfiguring (including the reapply after restart) cannot turn Hive
+    // files into the original snapshot.
+    configure_claude_desktop_in(&home, "model-b", "requrv_sk_new").unwrap();
+    for path in [&paths.third_party_config, &paths.meta, &paths.profile] {
+      assert!(!backup_path_for(path).exists());
+    }
     assert!(paths.profile.exists());
     restore_claude_desktop_in(&home).unwrap();
+    assert!(!paths.profile.exists());
+    assert!(!claude_desktop_configured_in(&home));
+    let _ = std::fs::remove_dir_all(&home);
+  }
+
+  #[test]
+  fn claude_desktop_restore_snapshot_preserves_foreign_profile_and_idempotence() {
+    let home = claude_test_home();
+    let paths = claude_desktop_paths_in(&home);
+    let original_normal = r#"{"deploymentMode":"1p","custom":"normal"}"#;
+    let original_third_party = r#"{"deploymentMode":"3p","custom":"third-party"}"#;
+    let original_meta = format!(
+      r#"{{"entries":[{{"id":"{CLAUDE_DESKTOP_PROFILE_ID}","name":"Ollama"}},{{"id":"foreign-profile","name":"Other"}}],"appliedId":"{CLAUDE_DESKTOP_PROFILE_ID}","custom":true}}"#
+    );
+    let original_profile = r#"{"inferenceProvider":"ollama","inferenceModels":[{"name":"llama3"}],"custom":true}"#;
+    for path in [&paths.normal_config, &paths.third_party_config, &paths.meta] {
+      std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
+    std::fs::write(&paths.normal_config, original_normal).unwrap();
+    std::fs::write(&paths.third_party_config, original_third_party).unwrap();
+    std::fs::write(&paths.meta, &original_meta).unwrap();
+    std::fs::write(&paths.profile, original_profile).unwrap();
+
+    configure_claude_desktop_in(&home, "model-a", "requrv_sk_test").unwrap();
+    restore_claude_desktop_in(&home).unwrap();
+    let snapshot = capture_claude_desktop_snapshot(&home).unwrap();
+
+    // Simulate Claude's shutdown persistence putting the managed state back.
+    set_deployment_mode(&paths.normal_config, "3p").unwrap();
+    set_deployment_mode(&paths.third_party_config, "3p").unwrap();
+    write_json(&paths.meta, &serde_json::json!({
+      "entries": [{ "id": CLAUDE_DESKTOP_PROFILE_ID, "name": CLAUDE_DESKTOP_PROFILE_NAME }],
+      "appliedId": CLAUDE_DESKTOP_PROFILE_ID
+    })).unwrap();
+    write_json(&paths.profile, &claude_desktop_profile_value("model-a", "requrv_sk_test")).unwrap();
+    apply_claude_desktop_snapshot(&snapshot).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&paths.normal_config).unwrap(), original_normal);
+    assert_eq!(std::fs::read_to_string(&paths.third_party_config).unwrap(), original_third_party);
+    assert_eq!(std::fs::read_to_string(&paths.meta).unwrap(), original_meta);
+    assert_eq!(std::fs::read_to_string(&paths.profile).unwrap(), original_profile);
+    // A second plain restore after backups are consumed must be a no-op, even
+    // when a foreign profile deliberately uses our legacy-colliding ID.
+    restore_claude_desktop_in(&home).unwrap();
+    assert_eq!(std::fs::read_to_string(&paths.meta).unwrap(), original_meta);
+    assert_eq!(std::fs::read_to_string(&paths.profile).unwrap(), original_profile);
+    // A file absent at snapshot time must stay absent after shutdown writes.
+    std::fs::remove_file(&paths.profile).unwrap();
+    let without_profile = capture_claude_desktop_snapshot(&home).unwrap();
+    write_json(&paths.profile, &claude_desktop_profile_value("model-a", "requrv_sk_test")).unwrap();
+    apply_claude_desktop_snapshot(&without_profile).unwrap();
     assert!(!paths.profile.exists());
     let _ = std::fs::remove_dir_all(&home);
   }
@@ -5386,9 +6200,11 @@ mod tests {
   #[test]
   fn mcp_claude_desktop_roundtrip() {
     let home = mcp_test_home();
-    let support = application_support_root(&home);
-    std::fs::create_dir_all(support.join("Claude")).unwrap();
-    let path = support.join("Claude/claude_desktop_config.json");
+    // Claude Desktop keeps its config under %LOCALAPPDATA% on Windows and under
+    // the app-support root elsewhere: ask the product resolver instead of
+    // assuming one layout, otherwise the fixture and the write target diverge.
+    let path = claude_desktop_paths_in(&home).normal_config;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, r#"{"deploymentMode":"1p"}"#).unwrap();
 
     write_mcp_target_in(&home, "claude_desktop", &mcp_server_fixture()).unwrap();
