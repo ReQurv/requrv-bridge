@@ -59,3 +59,15 @@ jobs:
       - name: Clippy
         working-directory: src-tauri
         run: cargo clippy -- -D warnings
+
+  rust-gate:
+    name: rust
+    needs: [rust]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify all Rust checks passed
+        run: |
+          echo "matrix result: ${{ needs.rust.result }}"
+          test "${{ needs.rust.result }}" = "success"
